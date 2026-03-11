@@ -62,129 +62,47 @@ local function read_progress()
 end
 
 -- ---------------------------------------------------------------------------
--- Helper: validate Lua syntax via luac (preferred) or loadstring fallback.
--- Returns nil on success, error string on failure.
--- ---------------------------------------------------------------------------
-local function check_lua_syntax(source, label)
-  -- Strategy 1: luac -p (catches more than loadstring — detects upvalue issues etc.)
-  local tmp = os.tmpname() .. ".lua"
-  local f = io.open(tmp, "w")
-  if f then
-    f:write(source); f:close()
-    local handle = io.popen(string.format('luac -p "%s" 2>&1', tmp))
-    local out = handle and handle:read("*a") or ""
-    if handle then handle:close() end
-    os.remove(tmp)
-    if out:match("%S") then
-      -- luac found errors
-      return "luac: " .. out:gsub("%s+$", "")
-    end
-    return nil   -- clean
-  end
-
-  -- Strategy 2: loadstring fallback (luac unavailable)
-  local chunk, err = load(source, label or "rewrite")
-  if not chunk then
-    return "syntax: " .. tostring(err)
-  end
-  return nil
-end
-
--- ---------------------------------------------------------------------------
--- Helper: extract Lua source from a completed opencode log.
---
--- Extraction order (most → least reliable):
---   1. Fenced block:  ```lua … ``` (proactive prompt uses this format)
---   2. Marker block:  REWRITE_MODULE: name … END_REWRITE  (same format)
---   3. Bare source:   first --[[ or "-- " header through last "return M"
---      This is the targeted-pass format (model returns raw Lua).
---
--- After extraction the source is validated:
---   • Must contain "return M" (basic module shape)
---   • Must pass luac -p / loadstring syntax check
--- ---------------------------------------------------------------------------
-local function extract_lua_source(log_content, mod_name)
-  local source = nil
-
-  -- 1. Fenced ```lua block (look for the LAST occurrence so we skip preamble)
-  local last_fence = nil
-  for block in log_content:gmatch("```lua\n(.-)\n```") do
-    last_fence = block
-  end
-  if last_fence and last_fence:find("return%s+M") then
-    source = last_fence
-  end
-
-  -- 2. REWRITE_MODULE marker block (mod_name optional — take the last one)
-  if not source then
-    local pattern = mod_name
-      and ("REWRITE_MODULE:%s*" .. mod_name .. "%s*\n```lua\n(.-)\n```\nEND_REWRITE")
-      or  "REWRITE_MODULE:%s*[%w_]+%s*\n```lua\n(.-)\n```\nEND_REWRITE"
-    local last_marker = nil
-    for block in log_content:gmatch(pattern) do last_marker = block end
-    if last_marker and last_marker:find("return%s+M") then
-      source = last_marker
-    end
-  end
-
-  -- 3. Bare-source fallback: header comment → last "return M"
-  if not source then
-    local lines = {}
-    for line in (log_content .. "\n"):gmatch("([^\n]*)\n") do
-      lines[#lines+1] = line
-    end
-    local start_idx, end_idx = nil, nil
-    for i, line in ipairs(lines) do
-      if not start_idx and (line:match("^%-%-%[%[") or line:match("^%-%-%s+modules/")) then
-        start_idx = i
-      end
-      if line:match("^return%s+M%s*$") then
-        end_idx = i   -- keep updating → last occurrence
-      end
-    end
-    if start_idx and end_idx and end_idx > start_idx then
-      local extracted = {}
-      for i = start_idx, end_idx do extracted[#extracted+1] = lines[i] end
-      local candidate = table.concat(extracted, "\n")
-      -- Sanity: candidate must be at least 100 chars (not a stub)
-      if #candidate >= 100 then source = candidate end
-    end
-  end
-
-  if not source then
-    logging.warn(string.format("[self_improve] %s: could not extract Lua source from log.", mod_name or "?"))
-    return nil
-  end
-
-  -- Structural checks (cheap, before the luac call)
-  if not source:find("return%s+M") then
-    logging.warn(string.format("[self_improve] %s: extracted source missing 'return M'.", mod_name or "?"))
-    return nil
-  end
-  if #source < 100 then
-    logging.warn(string.format("[self_improve] %s: extracted source suspiciously short (%d chars).", mod_name or "?", #source))
-    return nil
-  end
-
-  -- Syntax check
-  local syn_err = check_lua_syntax(source, mod_name)
-  if syn_err then
-    logging.warn(string.format("[self_improve] %s: syntax check FAILED — %s", mod_name or "?", syn_err))
-    return nil
-  end
-
-  logging.log(string.format("[self_improve] %s: extracted %d bytes, syntax OK.", mod_name or "?", #source))
-  return source
-end
-
--- ---------------------------------------------------------------------------
 -- Helper: run an improvement call and extract Lua source from log
 -- ---------------------------------------------------------------------------
-local function run_improve_call(model, prompt, log_path, mod_name)
+local function run_improve_call(model, prompt, log_path)
   local f = io.open(log_path, "w"); if f then f:close() end
   opencode.run_fresh(log_path, prompt, model)
+
   local log_content = read_file(log_path)
-  return extract_lua_source(log_content, mod_name)
+
+  -- Extract the Lua source block. The model is instructed to return raw Lua
+  -- with no markdown fences, starting with a comment header and ending with
+  -- "return M". We scan line-by-line to find the first line that looks like
+  -- a Lua module header and capture everything through the last "return M".
+  --
+  -- Strategy: collect all lines between the first ^--[[ or ^-- header and the
+  -- last occurrence of a line matching ^return M, inclusive.
+  local lines = {}
+  for line in (log_content .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines+1] = line
+  end
+
+  local start_idx = nil
+  local end_idx   = nil
+
+  for i, line in ipairs(lines) do
+    if start_idx == nil and (line:match("^%-%-%[%[") or line:match("^%-%- ")) then
+      start_idx = i
+    end
+    if line:match("^return%s+M") then
+      end_idx = i   -- keep updating so we get the LAST occurrence
+    end
+  end
+
+  if not start_idx or not end_idx or end_idx < start_idx then
+    return nil
+  end
+
+  local extracted = {}
+  for i = start_idx, end_idx do
+    extracted[#extracted+1] = lines[i]
+  end
+  return table.concat(extracted, "\n")
 end
 
 -- ---------------------------------------------------------------------------
@@ -193,14 +111,6 @@ end
 local function apply_rewrite(mod_name, new_source, reason)
   if not new_source or new_source:match("^%s*$") then
     logging.warn(string.format("[self_improve] %s: AI returned empty source — skipping.", mod_name))
-    return false
-  end
-
-  -- Syntax must be clean before we touch disk (extract_lua_source already
-  -- checks, but run_proactive feeds source directly here so check again).
-  local syn_err = check_lua_syntax(new_source, mod_name)
-  if syn_err then
-    logging.warn(string.format("[self_improve] %s: apply_rewrite syntax gate FAILED — %s", mod_name, syn_err))
     return false
   end
 
@@ -285,7 +195,7 @@ function M.run_targeted(model, reason, context)
     local log_path = string.format("%s/logs/self-improve-%s-%s-%s.log",
       cfg.PROJECT_PATH, mod_name, reason, run_ts)
 
-    local new_source = run_improve_call(model, prompt_text, log_path, mod_name)
+    local new_source = run_improve_call(model, prompt_text, log_path)
     apply_rewrite(mod_name, new_source, reason)
   end
 end
@@ -299,19 +209,58 @@ function M.run_proactive(model, session_summary)
     return
   end
 
+  -- Minimum task threshold: don't burn a full model call after a one-liner session
+  local min_tasks = cfg.SELF_IMPROVE_MIN_TASKS or 3
+  local total_tasks = (session_summary.tasks_done or 0) + (session_summary.tasks_failed or 0)
+  if total_tasks < min_tasks then
+    logging.log(string.format(
+      "[self_improve] Proactive pass skipped: %d task(s) < minimum %d.", total_tasks, min_tasks))
+    return
+  end
+
   logging.log("[self_improve] Proactive session-end pass...")
 
   local progress     = read_progress()
   local module_names = hot_reload.list()
   local run_ts       = os.date("%Y%m%d-%H%M%S")
 
-  local sources_block = {}
+  -- Rank modules: prioritise by failure relevance then source size.
+  -- Only send the top N modules with full source; list the rest by name only
+  -- to keep the prompt within a reasonable token budget.
+  local MAX_FULL_SOURCES = 3
+  local scores = {}
   for _, name in ipairs(module_names) do
+    local src = hot_reload.source(name) or ""
+    scores[name] = #src  -- base score = source size (more code = more to improve)
+  end
+  if (session_summary.tasks_failed or 0) > 0 then
+    scores["prompts"]      = (scores["prompts"]      or 0) + 5000
+    scores["opencode"]     = (scores["opencode"]     or 0) + 3000
+    scores["self_improve"] = (scores["self_improve"] or 0) + 2000
+    scores["compile"]      = (scores["compile"]      or 0) + 1000
+  end
+  if session_summary.user_request then
+    -- User explicitly asked for improvement — boost self_improve and prompts
+    scores["self_improve"] = (scores["self_improve"] or 0) + 8000
+    scores["prompts"]      = (scores["prompts"]      or 0) + 4000
+  end
+  table.sort(module_names, function(a, b) return (scores[a] or 0) > (scores[b] or 0) end)
+
+  local sources_block = {}
+  local remaining_names = {}
+  for i, name in ipairs(module_names) do
     local src  = hot_reload.source(name) or ""
     local path = module_path(name)
-    sources_block[#sources_block+1] = string.format(
-      "=== %s ===\nPath: %s\n%s\n", name, path, src:sub(1, 3000))
+    if i <= MAX_FULL_SOURCES then
+      sources_block[#sources_block+1] = string.format(
+        "=== %s ===\nPath: %s\n%s\n", name, path, src:sub(1, 4000))
+    else
+      remaining_names[#remaining_names+1] = name
+    end
   end
+  local remaining_note = #remaining_names > 0
+    and ("\n## Other available modules (full source not shown)\n" .. table.concat(remaining_names, ", ") .. "\n")
+    or  ""
 
   local mdir = modules_dir()
 
@@ -338,12 +287,12 @@ Project type : %s
 
 ## Recent progress
 %s
-
-## All module sources
+%s
+## Top candidate module sources
 %s
 
 ## Your task
-Review the session results and module sources.
+Review the session results and module sources above.
 Choose UP TO 2 modules that would most benefit from improvement.
 For each module you choose to rewrite, output a block in this exact format:
 
@@ -369,17 +318,25 @@ Rules:
        end
   7. If no improvements are warranted, output: NO_IMPROVEMENTS_NEEDED
 
+Output constraints:
+  - Maximum 2 REWRITE_MODULE blocks total.
+  - Each rewritten module: complete and valid, but no filler comments or padding.
+  - Keep each rewrite under 500 lines. If a module needs more changes than that,
+    focus on the highest-value improvements only.
+  - Total output should fit within 6000 tokens.
+
 After all rewrites (or NO_IMPROVEMENTS_NEEDED), output: DONE
 ]],
     session_summary.user_request and "a user-initiated improvement pass" or "the end-of-session proactive improvement pass",
     mdir,
-    _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
+    cfg.KERNEL_SOURCE_PATH or _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
     user_note,
     session_summary.tasks_done   or 0,
     session_summary.tasks_failed or 0,
     table.concat(session_summary.failed_nums or {}, ", "),
     cfg.PROJECT_TYPE,
     progress,
+    remaining_note,
     table.concat(sources_block, "\n"))
 
   os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. '/logs"')
@@ -390,9 +347,26 @@ After all rewrites (or NO_IMPROVEMENTS_NEEDED), output: DONE
   opencode.run_fresh(log_path, prompt, model)
 
   local log_content = read_file(log_path)
+  local rewrites_applied = 0
   for mod_name, new_source in log_content:gmatch(
     "REWRITE_MODULE:%s*([%w_]+)\n```lua\n(.-)\n```\nEND_REWRITE") do
-    apply_rewrite(mod_name, new_source, "proactive_session_end")
+    local old_size = #(hot_reload.source(mod_name) or "")
+    local applied = apply_rewrite(mod_name, new_source, "proactive_session_end")
+    if applied then
+      rewrites_applied = rewrites_applied + 1
+      -- Log outcome to SELF_IMPROVE_LOG.md
+      local log_entry = string.format(
+        "\n## %s | proactive | %s | %d→%d chars\n",
+        os.date("!%Y-%m-%d %H:%M"), mod_name, old_size, #new_source)
+      local lf = io.open(cfg.PROJECT_PATH .. "/SELF_IMPROVE_LOG.md", "a")
+      if lf then lf:write(log_entry); lf:close() end
+    end
+  end
+
+  if rewrites_applied > 0 then
+    logging.ok(string.format("[self_improve] Proactive pass applied %d rewrite(s).", rewrites_applied))
+  else
+    logging.log("[self_improve] Proactive pass: no rewrites applied.")
   end
 end
 
@@ -404,7 +378,7 @@ function M.suggest_kernel_improvements(model, context)
 
   -- These globals are set by run_automation.lua (the kernel). Access via _G
   -- explicitly so any missing-global errors are loud rather than silent nils.
-  local kernel_src_path = _G.KERNEL_SOURCE_PATH
+  local kernel_src_path = cfg.KERNEL_SOURCE_PATH or _G.KERNEL_SOURCE_PATH
   local kernel_version  = _G.KERNEL_VERSION
 
   if not kernel_src_path then

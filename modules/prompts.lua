@@ -141,7 +141,6 @@ function M.build_task_prompt(opts)
   local primary_dir = src_dirs[1] and (cfg.PROJECT_PATH .. "/" .. src_dirs[1]) or cfg.PROJECT_PATH
 
   -- Read state files inline (capped) — avoids a tool call round-trip per prompt
-  -- and makes the budget cap reliable vs. an unbounded tool-call read.
   local progress_text = read_tail(cfg.PROGRESS_FILE, ctx("CTX_PROGRESS_CHARS", 2000))
   local agents_text   = read_tail(cfg.AGENTS_FILE,   ctx("CTX_AGENTS_CHARS",   3000))
 
@@ -183,6 +182,26 @@ Skip straight to writing the file. Target directory: %s
     and (tool_context .. "\n\n")
     or  ""
 
+  -- Context budget enforcement: measure supplementary sections and gate
+  -- the file list so the total supplementary context stays under the cap.
+  -- Only include the file list on the first iteration — on retries the model
+  -- already knows which files exist (it just worked on them).
+  local hard_cap   = ctx("CTX_PROMPT_HARD_CAP", 12000)
+  local used_chars = #agents_text + #progress_text + #session_block
+                   + #section_block + #tool_block + #retry_block
+  local file_block = ""
+  if iteration == 1 then
+    local file_list = existing_sources_list()
+    if used_chars + #file_list <= hard_cap then
+      file_block = "## Existing files\n" .. file_list .. "\n\n"
+    else
+      file_block = "## Existing files\n(omitted — context budget)\n\n"
+      logging.log(string.format(
+        "[prompts] file list omitted: budget %d, used %d, list %d chars",
+        hard_cap, used_chars, #file_list))
+    end
+  end
+
   return string.format([[
 You are a %s developer. Write code immediately — do not explore first.
 
@@ -200,10 +219,7 @@ Dirs: %s
 
 ## Recent progress
 %s
-%s%s%s## Existing files
-%s
-
-## Task #%s
+%s%s%s%s## Task #%s
 %s
 
 ## On completion
@@ -219,6 +235,7 @@ Append one discovery note to %s/%s, then output: DONE
     session_block,
     section_block,
     tool_block,
+    file_block,
     existing_sources_list(),
     task_num, task_text,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE)
@@ -315,12 +332,26 @@ Rewrite to fix the problem described above. Rules:
   2. Module must return table M.
   3. Do not remove functionality.
   4. Keep all function signatures compatible.
-  5. If nothing needs changing, return source UNCHANGED.
+  5. Only call functions that actually exist on required modules.
+     NEVER invent function names on other modules (e.g. opencode.run_targeted,
+     prompts.build_improve_reason — these do not exist).
+  6. Include a M.validate() function that asserts any external module functions
+     this module calls actually exist at load time. Example:
+       function M.validate()
+         local oc = require("opencode")
+         assert(type(oc.run_fresh) == "function", "opencode.run_fresh missing")
+       end
+  7. If nothing needs changing, return source UNCHANGED.
+
+Output constraints:
+  - Output the complete rewritten source — no partial diffs.
+  - No padding, filler comments, or prose outside the Lua source itself.
+  - Keep output under 600 lines. If more is needed, focus on the highest-value changes only.
 
 Output the complete Lua source now, starting with the module header comment.
 ]],
     mod_path,
-    _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
+    cfg.KERNEL_SOURCE_PATH or _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
     reason, context_str, progress, mod_name, current_source)
 end
 
@@ -399,7 +430,7 @@ Respond with ONLY the category (and optional MODULE line). No explanation.
 Input: %s
 ]],
     tech, cfg.PROJECT_PATH,
-    _G.KERNEL_MODULES_DIR or "modules/",
+    cfg.KERNEL_MODULES_DIR or _G.KERNEL_MODULES_DIR or "modules/",
     known_mods,
     session_block,
     input)
@@ -429,6 +460,18 @@ M.FIX_NUDGE_PROMPT =
 
 function M.get_nudge(count)
   return _NUDGE_PROMPTS[((count - 1) % #_NUDGE_PROMPTS) + 1]
+end
+
+-- ---------------------------------------------------------------------------
+-- validate — called by hot_reload after a rewrite.
+-- Verifies that dependencies used by this module still export what we need.
+-- ---------------------------------------------------------------------------
+function M.validate()
+  local pt = require("project_type")
+  assert(type(pt.get_tech)     == "function", "project_type.get_tech missing")
+  assert(type(pt.get_src_dirs) == "function", "project_type.get_src_dirs missing")
+  local c = require("config")
+  assert(type(c.PROJECT_PATH)  ~= "nil",      "config.PROJECT_PATH missing")
 end
 
 return M

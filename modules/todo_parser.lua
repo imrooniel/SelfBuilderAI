@@ -79,31 +79,36 @@ end
 
 -- ---------------------------------------------------------------------------
 -- mark_task_done — flip [ ] → [x] in todo.md
+-- Uses plain string comparison to avoid regex issues with special characters.
 -- ---------------------------------------------------------------------------
 function M.mark_task_done(task_num, task_text)
-  local path    = cfg.PROJECT_PATH .. "/todo.md"
-  local f       = io.open(path, "r")
+  local path = cfg.PROJECT_PATH .. "/todo.md"
+  local f    = io.open(path, "r")
   if not f then return end
-  local lines   = {}
+  local lines = {}
   for line in f:lines() do lines[#lines+1] = line end
   f:close()
 
-  local escaped = task_text:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
-  -- Anchor to line start (^) and match the exact task number followed by a dot
-  -- to prevent task "1" matching inside "10", "11", etc.
-  local pattern = "^(" .. task_num .. "%.%s+%[)%s(%]%s+" .. escaped .. ")"
-  local matched = false
+  -- The two canonical forms a task line can take
+  local unchecked = task_num .. ". [ ] " .. task_text
+  local checked   = task_num .. ". [x] " .. task_text
+  local matched   = false
+
   for i, line in ipairs(lines) do
-    local new_line, n = line:gsub(pattern, "%1x%2")
-    if n > 0 then
-      lines[i] = new_line
+    local stripped = line:match("^%s*(.-)%s*$")
+    if stripped == unchecked then
+      -- Replace only the first [ ] on this line (idempotent-safe)
+      lines[i] = line:gsub("%[ %]", "[x]", 1)
       matched = true
+      break
+    elseif stripped == checked then
+      matched = true  -- already marked done — idempotent, nothing to write
       break
     end
   end
 
   if not matched then
-    logging.warn("mark_task_done: pattern not matched for task #" .. task_num)
+    logging.warn("mark_task_done: no match for task #" .. task_num .. " — text may have changed")
     return
   end
 

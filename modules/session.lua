@@ -225,4 +225,46 @@ function M.append_progress(task_num, task_text, note)
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- prune_old_logs — delete log files older than cfg.LOG_RETENTION_DAYS
+-- ---------------------------------------------------------------------------
+function M.prune_old_logs()
+  if not cfg.LOG_RETENTION_DAYS then return end
+  local log_dir = cfg.PROJECT_PATH .. "/logs"
+  local cutoff  = os.time() - (cfg.LOG_RETENTION_DAYS * 86400)
+
+  local handle = io.popen(string.format('ls "%s"/ 2>/dev/null', log_dir))
+  if not handle then return end
+
+  local files = {}
+  for name in handle:lines() do
+    if name:match("%.log$") or name:match("%.txt$") then
+      files[#files+1] = log_dir .. "/" .. name
+    end
+  end
+  handle:close()
+
+  -- Portable mtime check: try GNU stat, fall back to BSD stat
+  local stat_fmt
+  local th = io.popen("stat --version 2>/dev/null")
+  local tv = th and th:read("*l") or ""; if th then th:close() end
+  stat_fmt = tv:find("GNU") and 'stat -c "%%Y" "%s" 2>/dev/null'
+                             or 'stat -f "%%m" "%s" 2>/dev/null'
+
+  local pruned = 0
+  for _, path in ipairs(files) do
+    local sh = io.popen(string.format(stat_fmt, path))
+    local mtime = sh and tonumber(sh:read("*l")) or nil
+    if sh then sh:close() end
+    if mtime and mtime < cutoff then
+      os.remove(path)
+      pruned = pruned + 1
+    end
+  end
+
+  if pruned > 0 then
+    logging.log(string.format("Pruned %d old log file(s) (>%dd).", pruned, cfg.LOG_RETENTION_DAYS))
+  end
+end
+
 return M

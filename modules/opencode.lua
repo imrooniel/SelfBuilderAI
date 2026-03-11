@@ -91,10 +91,18 @@ local function unique_title()
 end
 
 -- ---------------------------------------------------------------------------
+-- Internal: sleep N seconds (portable)
+-- ---------------------------------------------------------------------------
+local function sleep(seconds)
+  os.execute(string.format("sleep %g 2>/dev/null || ping -n %d 127.0.0.1 >nul 2>&1",
+    seconds, math.ceil(seconds)))
+end
+
+-- ---------------------------------------------------------------------------
 -- Internal: resolve session ID from title
 -- ---------------------------------------------------------------------------
 local function resolve_session_id(title)
-  for _ = 1, 3 do
+  for attempt = 1, 6 do
     local handle = io.popen(string.format('"%s" session list 2>/dev/null', cfg.OPENCODE))
     if handle then
       for line in handle:lines() do
@@ -105,16 +113,9 @@ local function resolve_session_id(title)
       end
       handle:close()
     end
-    local t = os.time(); while os.time() - t < 1 do end
+    if attempt < 6 then sleep(attempt * 0.5) end  -- 0.5, 1, 1.5, 2, 2.5s backoff
   end
-
-  -- Fallback: newest session
-  local handle = io.popen(string.format('"%s" session list 2>/dev/null', cfg.OPENCODE))
-  if handle then
-    local first = handle:read("*l")
-    handle:close()
-    if first then return first:match("^(%S+)") end
-  end
+  logging.warn("resolve_session_id: title '" .. title .. "' not found after 6 attempts")
   return ""
 end
 

@@ -76,18 +76,30 @@ end
 -- ---------------------------------------------------------------------------
 -- git_commit
 -- ---------------------------------------------------------------------------
+local function clear_git_lock()
+  local lock = cfg.PROJECT_PATH .. "/.git/index.lock"
+  local f = io.open(lock, "r")
+  if f then
+    f:close()
+    logging.warn("git: stale index.lock found — removing.")
+    os.remove(lock)
+  end
+end
+
+local function git_has_staged_changes()
+  -- exit 0 = no staged changes, exit 1 = staged changes exist
+  local _, ok = git("diff --cached --quiet", false)
+  return ok ~= true
+end
+
 function M.git_commit(task_num, slug, task_text, compile_clean)
   if not M.is_git_repo() then
     logging.warn("Not a git repo — skipping commit.")
     return
   end
+  clear_git_lock()
   git("add -A")
-  local handle = io.popen(string.format(
-    'git -C "%s" diff --cached --quiet 2>/dev/null; echo $?', cfg.PROJECT_PATH))
-  local code = handle and handle:read("*a") or "1"
-  if handle then handle:close() end
-  code = code:gsub("%s+", "")
-  if code == "0" then
+  if not git_has_staged_changes() then
     logging.log("No staged changes to commit")
     return
   end
@@ -97,20 +109,32 @@ function M.git_commit(task_num, slug, task_text, compile_clean)
 end
 
 -- ---------------------------------------------------------------------------
--- snapshot_files — return {path → mtime} for all tracked source files
+-- snapshot_files — return a git tree-hash as a lightweight "before" marker.
+-- Falls back to a timestamp map if the project is not a git repo.
 -- ---------------------------------------------------------------------------
 function M.snapshot_files()
+  if M.is_git_repo() then
+    -- Record the current HEAD tree hash and any unstaged content hash.
+    -- We use `git status --porcelain` output as the snapshot: it lists every
+    -- file that differs from HEAD, so comparing two snapshots tells us what
+    -- changed between the two moments.
+    local handle = io.popen(string.format(
+      'git -C "%s" status --porcelain 2>/dev/null', cfg.PROJECT_PATH))
+    local lines = {}
+    if handle then
+      for line in handle:lines() do lines[#lines+1] = line end
+      handle:close()
+    end
+    return { _git = true, _status = table.concat(lines, "\n") }
+  end
+
+  -- Non-git fallback: mtime map (original implementation)
   local result = {}
   local extensions = project_type.get_extensions(cfg)
-
   local exts = {}
-  for ext in pairs(extensions) do
-    exts[#exts+1] = '-name "*' .. ext .. '"'
-  end
+  for ext in pairs(extensions) do exts[#exts+1] = '-name "*' .. ext .. '"' end
   if #exts == 0 then return result end
   local ext_filter = table.concat(exts, " -o ")
-
-  -- Build skip-dir prune expression
   local skip_parts = {}
   for dir in pairs(cfg.SNAPSHOT_SKIP_DIRS) do
     skip_parts[#skip_parts+1] = string.format('-name "%s" -prune', dir)
@@ -118,30 +142,20 @@ function M.snapshot_files()
   local skip_expr = #skip_parts > 0
     and "\\( " .. table.concat(skip_parts, " -o ") .. " \\) -o"
     or ""
-
-  -- Portable mtime: try GNU stat first, fall back to BSD stat (macOS)
-  -- GNU: stat -c "%Y %n"   BSD: stat -f "%m %N"
   local stat_cmd
   local test_handle = io.popen("stat --version 2>/dev/null")
   local stat_out = test_handle and test_handle:read("*l") or ""
   if test_handle then test_handle:close() end
-  if stat_out:find("GNU") then
-    stat_cmd = 'xargs -0 stat -c "%Y %n" 2>/dev/null'
-  else
-    stat_cmd = 'xargs -0 stat -f "%m %N" 2>/dev/null'
-  end
-
+  stat_cmd = stat_out:find("GNU") and 'xargs -0 stat -c "%Y %n" 2>/dev/null'
+                                   or 'xargs -0 stat -f "%m %N" 2>/dev/null'
   local cmd = string.format(
     'find "%s" %s \\( %s \\) -print0 2>/dev/null | %s',
     cfg.PROJECT_PATH, skip_expr, ext_filter, stat_cmd)
-
   local handle = io.popen(cmd)
   if handle then
     for line in handle:lines() do
       local mtime, path = line:match("^(%d+)%s+(.+)$")
-      if mtime and path then
-        result[path] = tonumber(mtime)
-      end
+      if mtime and path then result[path] = tonumber(mtime) end
     end
     handle:close()
   end
@@ -149,13 +163,45 @@ function M.snapshot_files()
 end
 
 -- ---------------------------------------------------------------------------
--- files_changed_since — return list of paths new/modified vs before snapshot
+-- files_changed_since — return list of paths changed since snapshot
 -- ---------------------------------------------------------------------------
 function M.files_changed_since(before)
-  local after   = M.snapshot_files()
+  if before and before._git then
+    -- Fast path: compare current git status against the snapshot
+    local handle = io.popen(string.format(
+      'git -C "%s" status --porcelain 2>/dev/null', cfg.PROJECT_PATH))
+    local current_lines = {}
+    if handle then
+      for line in handle:lines() do current_lines[#current_lines+1] = line end
+      handle:close()
+    end
+    local current_status = table.concat(current_lines, "\n")
+
+    -- Collect files that appear in current status but not (or differently) in before
+    local before_set = {}
+    for line in (before._status .. "\n"):gmatch("([^\n]+)\n?") do
+      local path = line:match("^..(.*)")
+      if path then before_set[path:match("^%s*(.-)%s*$")] = line end
+    end
+
+    local changed = {}
+    for line in (current_status .. "\n"):gmatch("([^\n]+)\n?") do
+      local path = line:match("^..(.*)")
+      if path then
+        path = path:match("^%s*(.-)%s*$")
+        if before_set[path] ~= line then
+          changed[#changed+1] = cfg.PROJECT_PATH .. "/" .. path
+        end
+      end
+    end
+    return changed
+  end
+
+  -- Non-git fallback: mtime comparison
+  local after = M.snapshot_files()
   local changed = {}
   for path, mtime in pairs(after) do
-    if before[path] ~= mtime then
+    if type(path) == "string" and before[path] ~= mtime then
       changed[#changed+1] = path
     end
   end

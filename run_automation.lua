@@ -120,8 +120,11 @@ function _G.__refresh_modules()
   self_improve = hot_reload.get("self_improve")  or self_improve
 end
 
--- Kernel source path exposed to self_improve (read-only use)
+-- Kernel source path exposed to self_improve (read-only use).
+-- Stored in both cfg and _G so modules can read it either way.
 KERNEL_SOURCE_PATH = BASE_DIR .. "run_automation.lua"
+cfg.KERNEL_SOURCE_PATH   = KERNEL_SOURCE_PATH
+cfg.KERNEL_MODULES_DIR   = BASE_DIR .. "modules"
 
 -- Orchestrator directory paths exposed to self_improve so it can tell the
 -- AI exactly where to find and write module files.
@@ -301,17 +304,14 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
   local elapsed = os.time() - task_start
 
   -- ----------------------------------------------------------------
-  -- Success path
+  -- Success path — DONE is required; files changed without DONE is a warning
   -- ----------------------------------------------------------------
-  if said_done or #changed > 0 then
-    if said_done and #changed > 0 then
-      logging.ok(string.format("Task #%s complete! (DONE + files changed) [iter=%d, nudges=%d, %ds]",
-        task_num, iteration, nudge_count, elapsed))
-    elseif said_done then
-      logging.ok(string.format("Task #%s complete! (DONE) [iter=%d, nudges=%d, %ds]",
-        task_num, iteration, nudge_count, elapsed))
+  if said_done then
+    if #changed > 0 then
+      logging.ok(string.format("Task #%s complete! (DONE + %d file(s) changed) [iter=%d, nudges=%d, %ds]",
+        task_num, #changed, iteration, nudge_count, elapsed))
     else
-      logging.ok(string.format("Task #%s complete! (files changed) [iter=%d, nudges=%d, %ds]",
+      logging.ok(string.format("Task #%s complete! (DONE, no file changes) [iter=%d, nudges=%d, %ds]",
         task_num, iteration, nudge_count, elapsed))
     end
 
@@ -399,6 +399,18 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
 
     git_utils.git_commit(task_num, slug, task_text, compile_clean)
 
+    -- Auto-update AGENTS.md with a brief record of what was done.
+    -- This makes the agents file a living document even when the model skips writing to it.
+    local af = io.open(cfg.PROJECT_PATH .. "/" .. cfg.AGENTS_FILE, "a")
+    if af then
+      local files_str = #changed > 0
+        and table.concat(changed, ", "):gsub(cfg.PROJECT_PATH .. "/", "")
+        or  "no files changed"
+      af:write(string.format("\n- [%s] Task #%s: %s → %s\n",
+        os.date("%Y-%m-%d"), task_num, task_text, files_str))
+      af:close()
+    end
+
     -- Mark done in todo.md only when called from todo-driven mode
     if all_tasks then
       todo_parser.mark_task_done(task_num, task_text)
@@ -412,6 +424,19 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
         iteration, elapsed, tostring(compile_clean)))
 
     return true
+  end
+
+  -- ----------------------------------------------------------------
+  -- Partial path — files changed but DONE never output
+  -- ----------------------------------------------------------------
+  if #changed > 0 then
+    logging.warn(string.format(
+      "Task #%s: %d file(s) changed but DONE was never output — treating as incomplete. [iter=%d, %ds]",
+      task_num, #changed, iteration, elapsed))
+    session.append_progress(task_num, task_text,
+      string.format("PARTIAL after %d iteration(s): files changed but no DONE. Review manually.", iteration))
+    git_utils.git_commit(task_num, slug, task_text, false)
+    return false
   end
 
   -- ----------------------------------------------------------------
@@ -453,11 +478,22 @@ local _readline_helper_path = nil
 local function ensure_readline_helper()
   if _readline_helper_path then return _readline_helper_path end
 
-  local path = cfg.PROJECT_PATH .. "/.ralph-readline-helper.py"
-  local f = io.open(path, "w")
-  if not f then
-    path = BASE_DIR .. ".ralph-readline-helper.py"
+  -- Check if the helper already exists at either candidate location
+  local candidates = {
+    cfg.PROJECT_PATH .. "/.ralph-readline-helper.py",
+    BASE_DIR .. ".ralph-readline-helper.py",
+  }
+  for _, path in ipairs(candidates) do
+    local f = io.open(path, "r")
+    if f then f:close(); _readline_helper_path = path; return path end
+  end
+
+  -- Write it fresh to the first writable location
+  local write_path = nil
+  local f = nil
+  for _, path in ipairs(candidates) do
     f = io.open(path, "w")
+    if f then write_path = path; break end
   end
   if not f then return nil end
 
@@ -505,8 +541,8 @@ if history_file:
     readline.write_history_file(history_file)
 ]])
   f:close()
-  _readline_helper_path = path
-  return path
+  _readline_helper_path = write_path
+  return write_path
 end
 
 local function readline_input(prompt)
@@ -546,12 +582,51 @@ end
 
 -- Unambiguous fast-path patterns — only used for cases where no reasonable
 -- human would mean anything other than what the pattern says.
+-- This eliminates the model round-trip for the majority of typical inputs.
 local function fast_classify(s)
   -- Explicit query override prefix
   if s:sub(1, 1) == "?" then return "query", nil end
-  -- Bare question mark ending with no task verb
+  -- Bare question mark ending with no leading verb
   if s:match("%?%s*$") and not s:match("^%a+%s") then return "query", nil end
-  return nil, nil  -- not obvious — use AI
+
+  -- Self-improve: clear imperative phrases about the orchestrator itself
+  local si_phrases = {
+    "improve yourself", "improve ralph", "improve the orchestrat",
+    "rewrite yourself", "fix yourself", "update yourself",
+  }
+  for _, p in ipairs(si_phrases) do
+    if s:find(p, 1, true) then return "self_improve", nil end
+  end
+  -- "improve <module_name>" — single-word target after "improve"
+  local mod = s:match("^improve%s+([%w_]+)$")
+  if mod and mod ~= "yourself" and mod ~= "ralph" and mod ~= "the" then
+    return "self_improve", mod
+  end
+  -- "improve prompts/opencode/etc" with trailing words still counts
+  local si_mod = s:match("^improve%s+([%w_]+)%s")
+  if si_mod then
+    local known = { config=1, logging=1, session=1, todo_parser=1, git_utils=1,
+                    compile=1, prompts=1, opencode=1, hot_reload=1,
+                    tool_registry=1, self_improve=1, project_type=1 }
+    if known[si_mod] then return "self_improve", si_mod end
+  end
+
+  -- Task: strong imperative verbs acting on project content
+  local task_verbs = {
+    "^add%s", "^create%s", "^build%s", "^write%s", "^implement%s",
+    "^refactor%s", "^delete%s", "^remove%s", "^rename%s", "^move%s",
+    "^update%s", "^change%s", "^make%s", "^generate%s", "^scaffold%s",
+  }
+  for _, p in ipairs(task_verbs) do
+    if s:find(p) then return "task", nil end
+  end
+
+  -- Fix/debug — task unless it's clearly about the orchestrator
+  if s:find("^fix%s") and not s:find("ralph") and not s:find("orchestrat") then
+    return "task", nil
+  end
+
+  return nil, nil  -- ambiguous — use AI
 end
 
 local function classify_input(input, model, session_ctx)
@@ -817,13 +892,14 @@ local function main()
 
   session.handle_session_archive()
   session.ensure_state_files(version)
+  session.prune_old_logs()
 
   -- Ensure git repo exists
   git_utils.ensure_git_repo()
 
   tool_reg.bootstrap()
 
-  local model = session.select_model()
+  local model = cfg.DEFAULT_MODEL or session.select_model()
   print()
 
   -- Scaffold source dirs for new projects

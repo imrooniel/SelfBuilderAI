@@ -92,9 +92,10 @@ M.TOOL_REGISTRY_FILE  = ".ralph-tools.json"
 -- ---------------------------------------------------------------------------
 -- Self-improvement settings
 -- ---------------------------------------------------------------------------
-M.SELF_IMPROVE_ENABLED  = true    -- set false to disable all AI self-improvement passes
-M.SELF_IMPROVE_TARGETED = true    -- targeted pass on task failure / compile error
+M.SELF_IMPROVE_ENABLED   = true   -- set false to disable all AI self-improvement passes
+M.SELF_IMPROVE_TARGETED  = true   -- targeted pass on task failure / compile error
 M.SELF_IMPROVE_PROACTIVE = true   -- proactive pass at end of each session
+M.SELF_IMPROVE_MIN_TASKS = 3      -- minimum tasks in a session before proactive pass runs
 
 -- ---------------------------------------------------------------------------
 -- Context budget — tune for your model's context window.
@@ -108,5 +109,23 @@ M.CTX_AGENTS_CHARS     = 3000   -- max chars of AGENTS.md injected per prompt
 M.CTX_FILE_LIST_MAX    = 20     -- max source file paths listed in prompt
 M.CTX_SECTION_TASKS    = 10     -- max sibling tasks shown in section_context
 M.CTX_JOURNAL_ENTRIES  = 10     -- max recent journal entries passed as session context
+M.CTX_PROMPT_HARD_CAP  = 12000  -- max chars of supplementary context per task prompt
+                                 -- (agents + progress + journal + files + tools combined)
+                                 -- 12k chars ≈ 3k–4k tokens; leaves plenty of room for output
+
+-- ---------------------------------------------------------------------------
+-- Model selection
+-- ---------------------------------------------------------------------------
+M.DEFAULT_MODEL = nil   -- e.g. "ollama/qwen3.5:35b-256k"; nil = interactive prompt at startup
+
+-- ---------------------------------------------------------------------------
+-- Log retention
+-- ---------------------------------------------------------------------------
+M.LOG_RETENTION_DAYS = 7   -- delete logs older than N days at session start; nil = keep forever
+
+-- ---------------------------------------------------------------------------
+-- Kernel path (set by run_automation.lua at boot; modules read cfg.KERNEL_SOURCE_PATH)
+-- ---------------------------------------------------------------------------
+M.KERNEL_SOURCE_PATH = nil
 
 return M

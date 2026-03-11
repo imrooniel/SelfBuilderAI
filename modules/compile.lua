@@ -98,7 +98,16 @@ function M.run_compile_check(error_out)
     if #blocking > 0 then
       local fw = io.open(error_out, "w")
       if fw then
-        table.sort(blocking)
+        -- Sort by filename then line number so the fix prompt reads naturally
+        table.sort(blocking, function(a, b)
+          local fa, la = a:match("([^:]+):(%d+)")
+          local fb, lb = b:match("([^:]+):(%d+)")
+          if fa and fb then
+            if fa == fb then return tonumber(la or 0) < tonumber(lb or 0) end
+            return fa < fb
+          end
+          return a < b
+        end)
         fw:write(table.concat(blocking, "\n") .. "\n"); fw:close()
       end
       return false
