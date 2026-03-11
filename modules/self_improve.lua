@@ -210,9 +210,11 @@ function M.run_proactive(model, session_summary)
   end
 
   -- Minimum task threshold: don't burn a full model call after a one-liner session
-  local min_tasks = cfg.SELF_IMPROVE_MIN_TASKS or 3
+  -- Minimum task threshold only applies to automatic end-of-session passes.
+  -- User-initiated requests always run regardless of task count.
+  local min_tasks   = cfg.SELF_IMPROVE_MIN_TASKS or 3
   local total_tasks = (session_summary.tasks_done or 0) + (session_summary.tasks_failed or 0)
-  if total_tasks < min_tasks then
+  if not session_summary.user_request and total_tasks < min_tasks then
     logging.log(string.format(
       "[self_improve] Proactive pass skipped: %d task(s) < minimum %d.", total_tasks, min_tasks))
     return
