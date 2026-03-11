@@ -1,17 +1,71 @@
 --[[
   modules/config.lua — all paths and tuneable constants.
-  AI-rewritable. Edit paths for your machine.
+  AI-rewritable. Edit paths for your machine and project type.
+
+  PROJECT_TYPE controls which workflow plugins are active:
+    "generic"  — any codebase, no compile check
+    "unity"    — Unity C# project (batch compile + inspectcode)
+    "rust"     — cargo build / cargo clippy
+    "node"     — npm run build / tsc
+    "python"   — pyflakes / mypy
+    "go"       — go build / go vet
+    "custom"   — supply your own compile_cmd / check_cmd below
 ]]
 
 local M = {}
 
 -- ---------------------------------------------------------------------------
--- Paths — edit these for your machine
+-- Core paths
 -- ---------------------------------------------------------------------------
-M.PROJECT_PATH  = "/home/patryk/Documents/LeviatanHunt"
-M.UNITY_EDITOR  = "/home/patryk/Unity/Hub/Editor/6000.3.10f1/Editor/Unity"
+M.PROJECT_PATH  = os.getenv("HOME") .. "/Documents/SelfBuilderAI"
 M.OPENCODE      = os.getenv("HOME") .. "/.opencode/bin/opencode"
-M.SOLUTION_FILE = "/home/patryk/Documents/LeviatanHunt/LeviatanHunt.sln"
+
+-- ---------------------------------------------------------------------------
+-- Project type — determines compile/check workflow
+-- ---------------------------------------------------------------------------
+M.PROJECT_TYPE  = "generic"   -- "unity"|"rust"|"node"|"python"|"go"|"generic"|"custom"
+
+-- ---------------------------------------------------------------------------
+-- Unity-specific (only used when PROJECT_TYPE == "unity")
+-- ---------------------------------------------------------------------------
+M.UNITY_EDITOR  = "/path/to/Unity/Hub/Editor/6000.x/Editor/Unity"
+M.SOLUTION_FILE = nil   -- nil = auto-discover *.sln in PROJECT_PATH
+
+-- ---------------------------------------------------------------------------
+-- Custom compile/check commands (only used when PROJECT_TYPE == "custom")
+-- %s is substituted with PROJECT_PATH
+-- ---------------------------------------------------------------------------
+M.CUSTOM_COMPILE_CMD = 'make -C "%s" 2>&1'
+M.CUSTOM_CHECK_CMD   = nil    -- optional secondary static-analysis command
+
+-- ---------------------------------------------------------------------------
+-- Language/tech description injected into every prompt
+-- (auto-populated from PROJECT_TYPE if left nil)
+-- ---------------------------------------------------------------------------
+M.TECH_DESCRIPTION = nil   -- e.g. "Rust 2021 with Tokio async runtime"
+
+-- ---------------------------------------------------------------------------
+-- Source file extensions tracked by the snapshot system
+-- (auto-populated from PROJECT_TYPE if left nil, override here if needed)
+-- ---------------------------------------------------------------------------
+M.SNAPSHOT_EXTENSIONS = nil   -- nil = auto from PROJECT_TYPE
+
+-- ---------------------------------------------------------------------------
+-- Directories to skip during snapshot
+-- ---------------------------------------------------------------------------
+M.SNAPSHOT_SKIP_DIRS = {
+  [".git"]       = true,
+  ["node_modules"] = true,
+  ["target"]     = true,   -- Rust
+  ["dist"]       = true,
+  ["build"]      = true,
+  ["__pycache__"] = true,
+  [".venv"]      = true,
+  ["Library"]    = true,   -- Unity
+  ["Temp"]       = true,   -- Unity
+  ["obj"]        = true,
+  ["Packages"]   = true,   -- Unity
+}
 
 -- ---------------------------------------------------------------------------
 -- Iteration limits
@@ -26,35 +80,20 @@ M.MAX_FIX_ROUNDS = 5   -- max compile-fix iterations per task
 M.SESSION_NAME = arg and arg[1] or "automation"
 
 -- ---------------------------------------------------------------------------
--- Ralph state files (relative to PROJECT_PATH)
+-- State files (relative to PROJECT_PATH)
 -- ---------------------------------------------------------------------------
 M.PROGRESS_FILE       = "progress.txt"
 M.AGENTS_FILE         = "AGENTS.md"
 M.ARCHIVE_DIR         = ".ralph-archive"
 M.LAST_SESSION_FILE   = ".ralph-last-session"
 M.KERNEL_SUGGESTIONS  = "KERNEL_SUGGESTIONS.md"
-M.TOOL_REGISTRY_FILE  = ".ralph-tools.json"   -- persisted tool metadata
+M.TOOL_REGISTRY_FILE  = ".ralph-tools.json"
 
 -- ---------------------------------------------------------------------------
--- File extensions tracked by the snapshot system
+-- Self-improvement settings
 -- ---------------------------------------------------------------------------
-M.SNAPSHOT_EXTENSIONS = {
-  [".cs"]      = true,
-  [".shader"]  = true,
-  [".hlsl"]    = true,
-  [".compute"] = true,
-  [".asmdef"]  = true,
-  [".asmref"]  = true,
-  [".json"]    = true,
-  [".asset"]   = true,
-}
-
-M.SNAPSHOT_SKIP_DIRS = {
-  [".git"]     = true,
-  ["Library"]  = true,
-  ["Temp"]     = true,
-  ["obj"]      = true,
-  ["Packages"] = true,
-}
+M.SELF_IMPROVE_ENABLED  = true    -- set false to disable all AI self-improvement passes
+M.SELF_IMPROVE_TARGETED = true    -- targeted pass on task failure / compile error
+M.SELF_IMPROVE_PROACTIVE = true   -- proactive pass at end of each session
 
 return M

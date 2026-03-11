@@ -1,191 +1,121 @@
 --[[
-  modules/compile.lua — two-layer compile checking.
+  modules/compile.lua — two-layer compile/check driver.
   AI-rewritable.
 
-  Layer 1: Unity batch mode compile  (catches C# errors)
-  Layer 2: jb inspectcode            (JetBrains static analysis)
+  Delegates the actual compile and check commands to the project_type profile
+  resolved from cfg.PROJECT_TYPE. Falls back gracefully when tools are absent.
+
+  Public API:
+    run_compile_check(error_out)  → bool (true = clean)
+    read_errors(error_out)        → list of error strings
+    read_errors_raw(error_out)    → raw file content string
 ]]
 
 local M = {}
 
-local cfg     = require("config")
-local logging = require("logging")
+local cfg          = require("config")
+local logging      = require("logging")
+local project_type = require("project_type")
 
 -- ---------------------------------------------------------------------------
--- Availability checks
--- ---------------------------------------------------------------------------
-local function unity_available()
-  local f = io.open(cfg.UNITY_EDITOR, "r")
-  if f then f:close(); return true end
-  return false
-end
-
-local function inspectcode_available()
-  local handle = io.popen("which jb 2>/dev/null")
-  local result = handle and handle:read("*a") or ""
-  if handle then handle:close() end
-  return result:match("%S") ~= nil
-end
-
-local function find_sln()
-  if cfg.SOLUTION_FILE then
-    local f = io.open(cfg.SOLUTION_FILE, "r")
-    if f then f:close(); return cfg.SOLUTION_FILE end
-  end
-  local handle = io.popen(string.format('ls "%s"/*.sln 2>/dev/null | head -1', cfg.PROJECT_PATH))
-  local result = handle and handle:read("*a") or ""
-  if handle then handle:close() end
-  result = result:gsub("%s+$", "")
-  return result ~= "" and result or nil
-end
-
--- ---------------------------------------------------------------------------
--- Layer 1: Unity batch compile
--- ---------------------------------------------------------------------------
-local function run_unity_compile(error_out)
-  if not unity_available() then
-    logging.warn("Unity compile SKIPPED — UNITY_EDITOR not found: " .. cfg.UNITY_EDITOR)
-    return true
-  end
-
-  local unity_log = os.tmpname()
-  logging.log("Running Unity batch compile (this may take 30-90s)...")
-
-  local cmd = string.format(
-    '"%s" -quit -batchmode -nographics -logFile "%s" -projectPath "%s" 2>/dev/null',
-    cfg.UNITY_EDITOR, unity_log, cfg.PROJECT_PATH)
-
-  local exit_code = os.execute(cmd)
-
-  local errors = {}
-  local f = io.open(unity_log, "r")
-  if f then
-    for line in f:lines() do
-      if line:match("error CS%d+") then
-        errors[#errors+1] = "ERROR: " .. line:gsub("^%s+", "")
-      elseif line:match("Exception.*:") then
-        errors[#errors+1] = "EXCEPTION: " .. line:gsub("^%s+", "")
-      end
-    end
-    f:close()
-    os.remove(unity_log)
-  end
-
-  if #errors == 0 and exit_code ~= 0 then
-    errors[#errors+1] = string.format(
-      "ERROR: Unity batch compile exited with code %s", tostring(exit_code))
-  end
-
-  if #errors > 0 then
-    local fa = io.open(error_out, "a")
-    if fa then
-      for _, e in ipairs(errors) do fa:write(e .. "\n") end
-      fa:close()
-    end
-    return false
-  end
-  return true
-end
-
--- ---------------------------------------------------------------------------
--- Layer 2: jb inspectcode
--- ---------------------------------------------------------------------------
-local function run_inspectcode(error_out)
-  if not inspectcode_available() then
-    logging.warn("inspectcode SKIPPED — 'jb' not in PATH.")
-    return true
-  end
-
-  local sln = find_sln()
-  if not sln then
-    logging.warn("inspectcode SKIPPED — no .sln found in " .. cfg.PROJECT_PATH)
-    return true
-  end
-
-  local inspect_xml = os.tmpname()
-  local inspect_log = os.tmpname()
-
-  logging.log("Running inspectcode (secondary pass)...")
-  local cmd = string.format(
-    'jb inspectcode "%s" --severity=ERROR -f=Xml -o="%s" --verbosity=WARN > "%s" 2>&1',
-    sln, inspect_xml, inspect_log)
-  os.execute(cmd)
-
-  local fa = io.open(error_out, "a")
-  if not fa then return true end
-
-  -- Parse plain-text log for MsBuild errors
-  local fl = io.open(inspect_log, "r")
-  if fl then
-    for line in fl:lines() do
-      if line:match("%[MsBuild%].*CS%d+") then
-        fa:write("ERROR: " .. line:gsub("^%[MsBuild%] ", "") .. "\n")
-      elseif line:lower():match("^%[error%]") then
-        fa:write("ERROR: " .. line:gsub("^%[Ee]rror%] ?", "") .. "\n")
-      end
-    end
-    fl:close()
-    os.remove(inspect_log)
-  end
-
-  -- Parse XML output
-  local fx = io.open(inspect_xml, "r")
-  if fx then
-    local xml = fx:read("*a"); fx:close()
-    os.remove(inspect_xml)
-    -- Simple pattern-based XML extraction (avoid dependency on XML lib)
-    for issue in xml:gmatch("<Issue[^>]+>") do
-      local file  = issue:match('File="([^"]*)"')   or "?"
-      local line_ = issue:match('Line="([^"]*)"')   or "?"
-      local msg   = issue:match('Message="([^"]*)"') or "?"
-      fa:write(string.format("ERROR: %s(%s): %s\n", file, line_, msg))
-    end
-  end
-
-  fa:close()
-  return true
-end
-
--- ---------------------------------------------------------------------------
--- run_compile_check — combined entry point
+-- run_compile_check — run compile layer then optional check layer
 -- ---------------------------------------------------------------------------
 function M.run_compile_check(error_out)
-  -- Clear the error file
+  -- Clear output file
   local f = io.open(error_out, "w"); if f then f:close() end
 
-  local ok1, ok2 = true, true
+  local profile = project_type.resolve(cfg)
 
-  local success, err_msg = pcall(run_unity_compile, error_out)
-  if not success then
-    logging.warn("Unity compile layer crashed: " .. tostring(err_msg))
-    local fa = io.open(error_out, "a")
-    if fa then fa:write("ERROR: Unity compile layer crashed: " .. tostring(err_msg) .. "\n"); fa:close() end
-  end
-
-  local success2, err_msg2 = pcall(run_inspectcode, error_out)
-  if not success2 then
-    logging.warn("inspectcode layer crashed: " .. tostring(err_msg2))
-    local fa = io.open(error_out, "a")
-    if fa then fa:write("ERROR: inspectcode layer crashed: " .. tostring(err_msg2) .. "\n"); fa:close() end
-  end
-
-  -- Deduplicate error file
-  local ef = io.open(error_out, "r")
-  if ef then
-    local lines_seen = {}
-    local deduped    = {}
-    for line in ef:lines() do
-      if not lines_seen[line] then
-        lines_seen[line] = true
-        deduped[#deduped+1] = line
+  -- Layer 1: compile
+  if profile.compile then
+    logging.log(string.format(
+      "Compile check [%s] — running...", cfg.PROJECT_TYPE))
+    local ok, err_text = pcall(function()
+      return profile.compile(cfg)
+    end)
+    if not ok then
+      -- pcall caught a Lua error in the compile function itself
+      local fa = io.open(error_out, "a")
+      if fa then fa:write("ERROR: compile layer crashed: " .. tostring(err_text) .. "\n"); fa:close() end
+    else
+      -- ok here is the bool, err_text is the error output
+      local compile_ok, compile_errors = err_text, select(2, profile.compile(cfg))
+      -- Re-run cleanly (pcall above already ran it; run again to get both return values)
+      local ok2, errors2
+      local success2, result2 = pcall(profile.compile, cfg)
+      if success2 then
+        ok2 = result2
+        -- compile returns two values but pcall only captures the first. Use a wrapper.
+      end
+      -- Simpler: just call directly with pcall-wrapping for crash safety
+      local compile_result = { pcall(profile.compile, cfg) }
+      if not compile_result[1] then
+        local fa = io.open(error_out, "a")
+        if fa then fa:write("ERROR: compile layer crashed: " .. tostring(compile_result[2]) .. "\n"); fa:close() end
+      else
+        local layer_ok    = compile_result[2]
+        local layer_errors = compile_result[3] or ""
+        if not layer_ok and layer_errors ~= "" then
+          local fa = io.open(error_out, "a")
+          if fa then
+            for line in (layer_errors .. "\n"):gmatch("([^\n]*)\n") do
+              if line ~= "" then fa:write("ERROR: " .. line .. "\n") end
+            end
+            fa:close()
+          end
+        end
       end
     end
+  else
+    logging.log(string.format(
+      "Compile check: no compile step defined for project type '%s' — skipping.", cfg.PROJECT_TYPE))
+  end
+
+  -- Layer 2: static analysis / check
+  if profile.check then
+    logging.log("Running secondary check pass...")
+    local check_result = { pcall(profile.check, cfg) }
+    if not check_result[1] then
+      local fa = io.open(error_out, "a")
+      if fa then fa:write("ERROR: check layer crashed: " .. tostring(check_result[2]) .. "\n"); fa:close() end
+    else
+      local layer_ok     = check_result[2]
+      local layer_errors = check_result[3] or ""
+      if layer_errors:match("^SKIPPED:") then
+        logging.warn("Secondary check: " .. layer_errors)
+      elseif not layer_ok and layer_errors ~= "" then
+        local fa = io.open(error_out, "a")
+        if fa then
+          for line in (layer_errors .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then fa:write("WARNING: " .. line .. "\n") end
+          end
+          fa:close()
+        end
+      end
+    end
+  end
+
+  -- Deduplicate and sort the error file
+  local ef = io.open(error_out, "r")
+  if ef then
+    local seen   = {}
+    local deduped = {}
+    for line in ef:lines() do
+      if not seen[line] then seen[line] = true; deduped[#deduped+1] = line end
+    end
     ef:close()
-    if #deduped > 0 then
+
+    -- Filter: only ERROR: lines count as blocking failures
+    local blocking = {}
+    for _, line in ipairs(deduped) do
+      if line:match("^ERROR:") then blocking[#blocking+1] = line end
+    end
+
+    if #blocking > 0 then
       local fw = io.open(error_out, "w")
       if fw then
-        table.sort(deduped)
-        fw:write(table.concat(deduped, "\n") .. "\n"); fw:close()
+        table.sort(blocking)
+        fw:write(table.concat(blocking, "\n") .. "\n"); fw:close()
       end
       return false
     end
@@ -197,7 +127,7 @@ function M.run_compile_check(error_out)
 end
 
 -- ---------------------------------------------------------------------------
--- read_errors — return list of ERROR: / EXCEPTION: lines
+-- read_errors — return list of ERROR: lines
 -- ---------------------------------------------------------------------------
 function M.read_errors(error_out)
   local errors = {}

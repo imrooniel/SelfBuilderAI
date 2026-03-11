@@ -5,21 +5,73 @@
 
 local M = {}
 
-local cfg     = require("config")
-local logging = require("logging")
+local cfg          = require("config")
+local logging      = require("logging")
+local project_type = require("project_type")
 
 -- ---------------------------------------------------------------------------
--- Unity version detection
+-- Project version detection (language-aware)
 -- ---------------------------------------------------------------------------
-function M.get_unity_version()
-  local pv_path = cfg.PROJECT_PATH .. "/ProjectSettings/ProjectVersion.txt"
-  local f = io.open(pv_path, "r")
-  if not f then return "unknown" end
-  for line in f:lines() do
-    local v = line:match("m_EditorVersion:%s+(%S+)")
-    if v then f:close(); return v end
+function M.get_project_version()
+  local pt = cfg.PROJECT_TYPE
+
+  if pt == "unity" then
+    local pv = cfg.PROJECT_PATH .. "/ProjectSettings/ProjectVersion.txt"
+    local f = io.open(pv, "r")
+    if not f then return "unknown" end
+    for line in f:lines() do
+      local v = line:match("m_EditorVersion:%s+(%S+)")
+      if v then f:close(); return v end
+    end
+    f:close(); return "unknown"
   end
-  f:close()
+
+  if pt == "rust" then
+    local f = io.open(cfg.PROJECT_PATH .. "/Cargo.toml", "r")
+    if f then
+      for line in f:lines() do
+        local v = line:match('^version%s*=%s*"([^"]+)"')
+        if v then f:close(); return v end
+      end
+      f:close()
+    end
+    local h = io.popen("rustc --version 2>/dev/null")
+    local r = h and h:read("*l") or "unknown"; if h then h:close() end
+    return r
+  end
+
+  if pt == "node" then
+    local f = io.open(cfg.PROJECT_PATH .. "/package.json", "r")
+    if f then
+      local content = f:read("*a"); f:close()
+      local v = content:match('"version"%s*:%s*"([^"]+)"')
+      if v then return v end
+    end
+    local h = io.popen("node --version 2>/dev/null")
+    local r = h and h:read("*l") or "unknown"; if h then h:close() end
+    return r
+  end
+
+  if pt == "python" then
+    local h = io.popen("python3 --version 2>/dev/null")
+    local r = h and h:read("*l") or "unknown"; if h then h:close() end
+    return r
+  end
+
+  if pt == "go" then
+    local f = io.open(cfg.PROJECT_PATH .. "/go.mod", "r")
+    if f then
+      for line in f:lines() do
+        local v = line:match("^go%s+(%S+)")
+        if v then f:close(); return "go " .. v end
+      end
+      f:close()
+    end
+    local h = io.popen("go version 2>/dev/null")
+    local r = h and h:read("*l") or "unknown"; if h then h:close() end
+    return r
+  end
+
   return "unknown"
 end
 
@@ -32,8 +84,8 @@ function M.handle_session_archive()
   if f then
     local last = f:read("*l"); f:close()
     if last and last ~= "" and last ~= cfg.SESSION_NAME then
-      local date_str     = os.date("%Y-%m-%d")
-      local archive_dir  = string.format("%s/%s/%s-%s",
+      local date_str    = os.date("%Y-%m-%d")
+      local archive_dir = string.format("%s/%s/%s-%s",
         cfg.PROJECT_PATH, cfg.ARCHIVE_DIR, date_str, last)
       logging.log(string.format(
         "Session changed (%s → %s) — archiving previous run...", last, cfg.SESSION_NAME))
@@ -43,7 +95,6 @@ function M.handle_session_archive()
         os.execute(string.format('cp "%s" "%s/" 2>/dev/null', src, archive_dir))
       end
       logging.log("Archived to: " .. archive_dir)
-      -- Reset progress for new session
       local pf = io.open(cfg.PROJECT_PATH .. "/" .. cfg.PROGRESS_FILE, "w")
       if pf then pf:write(""); pf:close() end
     end
@@ -53,9 +104,12 @@ function M.handle_session_archive()
 end
 
 -- ---------------------------------------------------------------------------
--- Bootstrap Ralph state files
+-- Bootstrap state files
 -- ---------------------------------------------------------------------------
-function M.ensure_state_files(unity_version)
+function M.ensure_state_files(version)
+  local tech = project_type.get_tech(cfg)
+  local src_dirs = project_type.get_src_dirs(cfg)
+
   local pf_path = cfg.PROJECT_PATH .. "/" .. cfg.PROGRESS_FILE
   local pf = io.open(pf_path, "r")
   if not pf then
@@ -75,28 +129,33 @@ function M.ensure_state_files(unity_version)
   if not af then
     local fw = io.open(af_path, "w")
     if fw then
+      local dir_lines = {}
+      for _, d in ipairs(src_dirs) do
+        dir_lines[#dir_lines+1] = "- " .. d
+      end
       fw:write(string.format([[
-# AGENTS.md — Unity Project Codebase Patterns
+# AGENTS.md — Project Codebase Patterns
 Auto-updated by the task runner after each completed task.
 The model reads this at the start of every iteration.
 
-## Project: LeviatanHunt
-Unity version: %s
+## Project: %s
+Technology: %s
+Version: %s
 
-## Layout
-- Assets/Scripts/Core/      — MonoBehaviour scripts
-- Assets/Scripts/Editor/    — Editor-only scripts
-- Assets/Shaders/           — Shader files
-- Assets/ScriptableObjects/ — Data assets
+## Source layout
+%s
 
 ## Conventions
-- Follow standard Unity C# naming conventions
-- MonoBehaviours go in Assets/Scripts/Core/
-- Editor scripts go in Assets/Scripts/Editor/
+- Follow standard conventions for %s
+- Write clean, idiomatic code
+- Prefer small, focused modules/files
 
 ## Known Patterns
 <!-- The model appends discoveries here after each task -->
-]], unity_version))
+]],
+        cfg.SESSION_NAME, tech, version,
+        table.concat(dir_lines, "\n"),
+        tech))
       fw:close()
     end
   else
@@ -105,27 +164,38 @@ Unity version: %s
 end
 
 -- ---------------------------------------------------------------------------
+-- Scaffold project directory structure
+-- ---------------------------------------------------------------------------
+function M.scaffold_project_dirs()
+  local src_dirs = project_type.get_src_dirs(cfg)
+  for _, d in ipairs(src_dirs) do
+    os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. "/" .. d .. '"')
+  end
+  logging.ok("Project directory scaffold created.")
+end
+
+-- ---------------------------------------------------------------------------
 -- Model selection
 -- ---------------------------------------------------------------------------
 function M.select_model()
-  print("Fetching Ollama models...")
-  local cfg_mod = require("config")
-  local handle = io.popen(string.format('"%s" models 2>/dev/null', cfg_mod.OPENCODE))
+  print("Fetching available models...")
+  local handle = io.popen(string.format('"%s" models 2>/dev/null', cfg.OPENCODE))
   local models = {}
   if handle then
     for line in handle:lines() do
-      if line:match("^ollama/") then
-        models[#models+1] = line:gsub("^ollama/", "")
+      if line:match("^ollama/") or line:match("^anthropic/") or
+         line:match("^openai/") or line:match("^google/") then
+        models[#models+1] = line:gsub("^%s+", ""):gsub("%s+$", "")
       end
     end
     handle:close()
   end
 
   if #models == 0 then
-    logging.err("No Ollama models found. Is Ollama running?"); os.exit(1)
+    logging.err("No models found. Is opencode running and configured?"); os.exit(1)
   end
 
-  print("\nAvailable Ollama models:")
+  print("\nAvailable models:")
   for i, m in ipairs(models) do
     print(string.format("  %d) %s", i, m))
   end
@@ -138,7 +208,8 @@ function M.select_model()
     logging.err("Invalid selection: '" .. tostring(choice) .. "'"); os.exit(1)
   end
 
-  local selected = "ollama/" .. models[idx]
+  -- Normalize: strip provider prefix for ollama models to match opencode CLI expectation
+  local selected = models[idx]
   logging.log("Using model: " .. selected)
   return selected
 end

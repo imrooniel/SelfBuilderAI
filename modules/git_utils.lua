@@ -5,8 +5,9 @@
 
 local M = {}
 
-local cfg     = require("config")
-local logging = require("logging")
+local cfg          = require("config")
+local logging      = require("logging")
+local project_type = require("project_type")
 
 -- ---------------------------------------------------------------------------
 -- git() — run a git command in the project directory
@@ -27,9 +28,40 @@ function M.git(args, check)
 end
 
 -- ---------------------------------------------------------------------------
+-- is_git_repo — check whether the project is a git repo (or can become one)
+-- ---------------------------------------------------------------------------
+function M.is_git_repo()
+  local _, ok = git("rev-parse --git-dir", false)
+  return ok == true or ok == 0
+end
+
+-- ---------------------------------------------------------------------------
+-- ensure_git_repo — initialise git if not already present
+-- ---------------------------------------------------------------------------
+function M.ensure_git_repo()
+  if not M.is_git_repo() then
+    logging.log("Initialising git repository in " .. cfg.PROJECT_PATH)
+    git("init")
+    git('config user.email "ralph-automation@localhost"', false)
+    git('config user.name "Ralph Automation"', false)
+    -- Create an initial commit so branches can be made
+    local readme = cfg.PROJECT_PATH .. "/README.md"
+    local f = io.open(readme, "w")
+    if f then f:write("# " .. cfg.SESSION_NAME .. "\n"); f:close() end
+    git("add -A")
+    git('commit -m "chore: init repo"')
+    logging.ok("Git repository initialised.")
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- ensure_branch
 -- ---------------------------------------------------------------------------
 function M.ensure_branch(branch_name)
+  if not M.is_git_repo() then
+    logging.warn("Not a git repo — skipping branch management.")
+    return
+  end
   local _, exists = git('rev-parse --verify "' .. branch_name .. '"', false)
   if exists then
     logging.log("Using existing branch: " .. branch_name)
@@ -44,9 +76,11 @@ end
 -- git_commit
 -- ---------------------------------------------------------------------------
 function M.git_commit(task_num, slug, task_text, compile_clean)
+  if not M.is_git_repo() then
+    logging.warn("Not a git repo — skipping commit.")
+    return
+  end
   git("add -A")
-  local diff, _ = git("diff --cached --quiet", false)
-  -- if diff is empty string and exit 0, nothing to commit
   local handle = io.popen(string.format(
     'git -C "%s" diff --cached --quiet 2>/dev/null; echo $?', cfg.PROJECT_PATH))
   local code = handle and handle:read("*a") or "1"
@@ -66,11 +100,13 @@ end
 -- ---------------------------------------------------------------------------
 function M.snapshot_files()
   local result = {}
-  -- Use find to enumerate files with their mtimes
+  local extensions = project_type.get_extensions(cfg)
+
   local exts = {}
-  for ext in pairs(cfg.SNAPSHOT_EXTENSIONS) do
+  for ext in pairs(extensions) do
     exts[#exts+1] = '-name "*' .. ext .. '"'
   end
+  if #exts == 0 then return result end
   local ext_filter = table.concat(exts, " -o ")
 
   -- Build skip-dir prune expression

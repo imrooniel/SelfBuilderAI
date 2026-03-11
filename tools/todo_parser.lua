@@ -86,7 +86,6 @@ function M.mark_task_done(task_num, task_text)
   if not f then return end
   local content = f:read("*a"); f:close()
 
-  -- Escape magic chars in task_text for pattern
   local escaped = task_text:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
   local pattern = "(" .. task_num .. "%.%s+%[)%s(%]%s+" .. escaped .. ")"
   local new_content, n = content:gsub(pattern, "%1x%2")

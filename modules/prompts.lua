@@ -1,31 +1,43 @@
 --[[
   modules/prompts.lua — task and fix prompt builders, nudge rotation.
-  AI-rewritable — this is the highest-value module for self-improvement.
+  AI-rewritable — highest-value module for self-improvement.
+
+  Prompts are project-type-aware: they inject the correct technology
+  description, source directories, and language-specific context.
 ]]
 
 local M = {}
 
-local cfg = require("config")
+local cfg          = require("config")
+local project_type = require("project_type")
 
 -- ---------------------------------------------------------------------------
--- Helper: list existing C# scripts
+-- Helper: list existing source files
 -- ---------------------------------------------------------------------------
-local function existing_scripts_list()
-  local handle = io.popen(string.format(
-    'find "%s/Assets/Scripts" -name "*.cs" 2>/dev/null | grep -v Library | grep -v Temp | head -40',
-    cfg.PROJECT_PATH))
-  if not handle then return "none yet — fresh project" end
+local function existing_sources_list(max)
+  max = max or 40
+  local src_dirs = project_type.get_src_dirs(cfg)
   local paths = {}
-  for line in handle:lines() do
-    paths[#paths+1] = line:gsub(cfg.PROJECT_PATH .. "/", "")
+  for _, dir in ipairs(src_dirs) do
+    local full = cfg.PROJECT_PATH .. "/" .. dir
+    local handle = io.popen(string.format(
+      'find "%s" -type f 2>/dev/null | grep -v "__pycache__" | grep -v ".pyc" | head -20',
+      full))
+    if handle then
+      for line in handle:lines() do
+        paths[#paths+1] = line:gsub(cfg.PROJECT_PATH .. "/", "")
+        if #paths >= max then break end
+      end
+      handle:close()
+    end
+    if #paths >= max then break end
   end
-  handle:close()
   if #paths == 0 then return "none yet — fresh project" end
   return table.concat(paths, ", ")
 end
 
 -- ---------------------------------------------------------------------------
--- Helper: read a state file for context injection
+-- Helper: read a state file
 -- ---------------------------------------------------------------------------
 local function read_state_file(rel_path)
   local f = io.open(cfg.PROJECT_PATH .. "/" .. rel_path, "r")
@@ -35,16 +47,32 @@ local function read_state_file(rel_path)
 end
 
 -- ---------------------------------------------------------------------------
+-- Helper: build source directory layout string for prompts
+-- ---------------------------------------------------------------------------
+local function src_dir_listing()
+  local src_dirs = project_type.get_src_dirs(cfg)
+  local lines = {}
+  for _, d in ipairs(src_dirs) do
+    lines[#lines+1] = "- " .. cfg.PROJECT_PATH .. "/" .. d
+  end
+  return table.concat(lines, "\n")
+end
+
+-- ---------------------------------------------------------------------------
 -- build_task_prompt
 -- ---------------------------------------------------------------------------
 function M.build_task_prompt(opts)
-  local task_num       = opts.task_num
-  local task_text      = opts.task_text
+  local task_num        = opts.task_num
+  local task_text       = opts.task_text
   local section_context = opts.section_context or ""
-  local iteration      = opts.iteration or 1
-  local prior_note     = opts.prior_note or "No details recorded."
-  local unity_version  = opts.unity_version or "unknown"
-  local tool_context   = opts.tool_context or ""
+  local iteration       = opts.iteration or 1
+  local prior_note      = opts.prior_note or "No details recorded."
+  local version         = opts.version or "unknown"
+  local tool_context    = opts.tool_context or ""
+
+  local tech     = project_type.get_tech(cfg)
+  local src_dirs = project_type.get_src_dirs(cfg)
+  local primary_dir = src_dirs[1] and (cfg.PROJECT_PATH .. "/" .. src_dirs[1]) or cfg.PROJECT_PATH
 
   local retry_block = ""
   if iteration > 1 then
@@ -53,21 +81,66 @@ function M.build_task_prompt(opts)
 ## !! RETRY — iteration %d/%d !!
 Previous attempt(s) made NO file changes. This is unacceptable.
 What was noted: %s
-DO NOT explore or ls again. Skip straight to writing the file.
-Target path: %s/Assets/Scripts/Core/
+DO NOT explore or list directories again. Skip straight to writing the file.
+Target directory: %s
 Create the file NOW using write_file or a shell command.
-]], iteration, cfg.MAX_ITERATIONS, prior_note, cfg.PROJECT_PATH)
+]], iteration, cfg.MAX_ITERATIONS, prior_note, primary_dir)
+  end
+
+  -- Inject project-type-specific extra context
+  local type_hints = ""
+  local pt = cfg.PROJECT_TYPE
+  if pt == "unity" then
+    type_hints = string.format([[
+## Unity-specific rules
+- Namespace: use your project namespace (see AGENTS.md)
+- MonoBehaviours → Assets/Scripts/Core/
+- Editor scripts → Assets/Scripts/Editor/ (only compiled in Editor)
+- Never use deprecated Unity APIs
+- Version: %s
+]], version)
+  elseif pt == "rust" then
+    type_hints = [[
+## Rust-specific rules
+- Use idiomatic Rust (clippy-clean)
+- Prefer Result<T,E> over unwrap() in library code
+- Keep unsafe blocks minimal and documented
+- Add doc comments (///) to public items
+]]
+  elseif pt == "node" then
+    type_hints = [[
+## TypeScript/Node-specific rules
+- Prefer strict TypeScript — avoid `any`
+- Use ES2022+ syntax
+- Export types explicitly
+- Keep functions pure where possible
+]]
+  elseif pt == "python" then
+    type_hints = [[
+## Python-specific rules
+- Follow PEP 8 and PEP 257 (docstrings)
+- Use type hints throughout
+- Prefer dataclasses/Pydantic for data models
+- Avoid mutable default arguments
+]]
+  elseif pt == "go" then
+    type_hints = [[
+## Go-specific rules
+- Follow effective Go conventions
+- Return errors explicitly (don't panic)
+- Add comments to all exported symbols
+- Keep goroutines and channels documented
+]]
   end
 
   return string.format([[
-You are a Unity %s C# developer. Your job is to write code, not explore.
+You are a %s developer. Your job is to write code, not explore.
 
 ## CRITICAL RULES — read before anything else
 1. DO NOT spend more than one tool call on exploration.
-2. Write the required .cs file(s) IMMEDIATELY.
-3. Output directory already exists: %s/Assets/Scripts/Core/
-4. ALWAYS read a file with the Read tool before editing or overwriting it.
-5. When done, output a line containing ONLY the word: DONE
+2. Write the required file(s) IMMEDIATELY.
+3. ALWAYS read a file with the Read tool before editing or overwriting it.
+4. When done, output a line containing ONLY the word: DONE
 
 ## Persistent memory — read these two files first (one tool call each):
 - %s/%s
@@ -75,21 +148,19 @@ You are a Unity %s C# developer. Your job is to write code, not explore.
 
 ## Project
 Path: %s
-Unity: %s
-Namespace: IchorAndBone.Core
+Technology: %s
+Version: %s
 
-## Existing scripts (for reference only — do not re-read all of them)
+## Existing source files (for reference only — do not re-read all of them)
 %s
 
 ## Directory layout
-- %s/Assets/Scripts/Core/    ← write new MonoBehaviours HERE
-- %s/Assets/Scripts/Editor/  ← editor-only scripts
-- %s/Assets/ScriptableObjects/
-- %s/Assets/Shaders/
+%s
+%s
 %s
 %s
 
-## Section context
+## Section context (other tasks in this batch for coherence)
 %s
 
 ## Task #%s — implement this now
@@ -98,29 +169,26 @@ Namespace: IchorAndBone.Core
 ## Your action sequence (follow exactly, in order)
 1. Read %s/%s
 2. Read %s/%s
-3. Write the required file(s) to %s/Assets/Scripts/Core/
+3. Write the required file(s)
 4. Append a one-line discovery note to %s/%s
 5. Output exactly: DONE
 ]],
-    unity_version,
-    cfg.PROJECT_PATH,
+    tech,
     cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE,
     cfg.PROJECT_PATH,
-    unity_version,
-    existing_scripts_list(),
-    cfg.PROJECT_PATH,
-    cfg.PROJECT_PATH,
-    cfg.PROJECT_PATH,
-    cfg.PROJECT_PATH,
+    tech,
+    version,
+    existing_sources_list(),
+    src_dir_listing(),
     retry_block,
+    type_hints,
     tool_context,
     section_context,
     task_num,
     task_text,
     cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE,
-    cfg.PROJECT_PATH,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE)
 end
 
@@ -128,17 +196,19 @@ end
 -- build_fix_prompt
 -- ---------------------------------------------------------------------------
 function M.build_fix_prompt(opts)
-  local task_num      = opts.task_num
-  local task_text     = opts.task_text
+  local task_num       = opts.task_num
+  local task_text      = opts.task_text
   local compile_errors = opts.compile_errors or ""
-  local unity_version = opts.unity_version or "unknown"
+  local version        = opts.version or "unknown"
+
+  local tech = project_type.get_tech(cfg)
 
   return string.format([[
-You are a Unity %s C# developer. Fix compile errors — do not explore.
+You are a %s developer. Fix compile/check errors — do not explore.
 
 ## CRITICAL RULES
 1. Read each file BEFORE editing — editing without reading first will fail.
-2. Open the file(s) listed in the errors below immediately.
+2. Open the file(s) listed in the errors below IMMEDIATELY.
 3. Fix ONLY the reported errors. Do not restructure working code.
 4. Output a line containing ONLY: DONE
 
@@ -149,10 +219,10 @@ You are a Unity %s C# developer. Fix compile errors — do not explore.
 ## Task that was implemented
 #%s: %s
 
-## Compile errors to fix NOW
+## Errors to fix NOW
 %s
 
-## Files in Assets/Scripts/
+## Existing source files
 %s
 
 ## Action sequence
@@ -162,14 +232,53 @@ You are a Unity %s C# developer. Fix compile errors — do not explore.
 4. Edit the file(s) to fix the errors (Edit tool)
 5. Output exactly: DONE
 ]],
-    unity_version,
+    tech,
     cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE,
     task_num, task_text,
     compile_errors,
-    existing_scripts_list(),
+    existing_sources_list(),
     cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE)
+end
+
+-- ---------------------------------------------------------------------------
+-- build_self_improve_prompt
+-- ---------------------------------------------------------------------------
+function M.build_self_improve_prompt(opts)
+  local mod_name       = opts.mod_name
+  local current_source = opts.current_source or ""
+  local reason         = opts.reason or "general"
+  local context_str    = opts.context_str or ""
+  local progress       = opts.progress or ""
+
+  return string.format([[
+You are an expert Lua developer improving a programming automation orchestration system.
+
+## Improvement trigger
+Reason: %s
+Context: %s
+
+## Cross-task learnings (progress.txt)
+%s
+
+## Current source of module: %s
+```lua
+%s
+```
+
+## Your task
+Rewrite this module to fix the problem described above.
+Rules:
+  1. Return ONLY valid Lua 5.4 source code — no markdown, no explanation, no backticks.
+  2. The module must return a table named M.
+  3. Do not remove existing functionality — only improve or fix.
+  4. Keep all existing function signatures compatible.
+  5. If nothing needs changing, return the source UNCHANGED.
+
+Output the complete new Lua source now, starting with the module header comment.
+]],
+    reason, context_str, progress, mod_name, current_source)
 end
 
 -- ---------------------------------------------------------------------------
@@ -189,10 +298,14 @@ local _NUDGE_PROMPTS = {
     .. "Write the next required file and output DONE.",
 
   "Almost there — finish the implementation and output DONE on its own line.",
+
+  "Stop re-reading files. Write the code that is still missing, then output DONE.",
+
+  "One final push — complete the remaining implementation and output DONE.",
 }
 
 M.FIX_NUDGE_PROMPT =
-  "Continue fixing the compile errors. Output DONE when all errors are resolved."
+  "Continue fixing the errors. Output DONE when all errors are resolved."
 
 function M.get_nudge(count)
   return _NUDGE_PROMPTS[((count - 1) % #_NUDGE_PROMPTS) + 1]

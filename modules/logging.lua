@@ -7,7 +7,6 @@ local M = {}
 
 -- Detect whether stdout is a TTY
 local function is_tty()
-  -- lua doesn't have isatty() natively; check $TERM as a proxy
   local term = os.getenv("TERM")
   return term and term ~= "dumb"
 end
@@ -33,6 +32,8 @@ M.bold_red    = function(t) return c("1;31", t) end
 M.bold_white  = function(t) return c("1",    t) end
 M.magenta     = function(t) return c("35",   t) end
 M.bold_cyan   = function(t) return c("1;36", t) end
+M.blue        = function(t) return c("34",   t) end
+M.bold_blue   = function(t) return c("1;34", t) end
 
 -- Log-level functions
 function M.log(msg)
@@ -57,6 +58,10 @@ end
 
 function M.thinking(msg)
   print(c("2;35", msg))
+end
+
+function M.step(label, msg)
+  print(M.bold_blue(string.format("[%-8s]", label)) .. " " .. msg)
 end
 
 return M

@@ -1,5 +1,6 @@
 --[[
   modules/tool_registry.lua — dynamic tool loading and calling.
+  AI-rewritable.
 
   The AI agent can write new Lua files to tools/ at runtime.
   This module scans tools/, loads them, and:
@@ -11,20 +12,14 @@
   ─────────────
   Every file in tools/ must return a table with:
     {
-      name        = "tool_name",          -- matches filename without .lua
+      name        = "tool_name",
       description = "what this tool does",
-      params      = "param description",  -- shown in prompt
-      run         = function(params_str)  -- receives raw param string
-                      return result_string, err_string_or_nil
-                    end,
+      params      = "param description",
+      run         = function(params_str) → result_string, err_string_or_nil
     }
 
-  The AI triggers a tool by writing in its output (anywhere on its own line):
+  The AI triggers a tool by writing (anywhere on its own line):
     TOOL_CALL: tool_name | param string here
-
-  The orchestrator reads completed log files, extracts TOOL_CALL lines,
-  runs the tools, and appends results as:
-    TOOL_RESULT: tool_name | <result or ERROR: msg>
 ]]
 
 local M = {}
@@ -55,14 +50,14 @@ end
 -- bootstrap — scan tools/ and register all .lua files found
 -- ---------------------------------------------------------------------------
 function M.bootstrap()
-  local tools_dir = cfg.PROJECT_PATH .. "/../tools"   -- relative to project
-  -- Also scan next to run_automation.lua
-  local dirs = {
-    tools_dir,
-    -- script-relative tools/ (resolved via package.path search)
-    package.path:match("(.-)/modules/") and
-      package.path:match("(.-)/modules/") .. "/tools" or nil,
-  }
+  local dirs = {}
+
+  -- tools/ next to run_automation.lua
+  local base = package.path:match("(.-)/modules/")
+  if base then dirs[#dirs+1] = base .. "/tools" end
+
+  -- tools/ inside project
+  dirs[#dirs+1] = cfg.PROJECT_PATH .. "/tools"
 
   for _, dir in ipairs(dirs) do
     if dir then
@@ -82,13 +77,13 @@ function M.bootstrap()
 
   local count = 0
   for _ in pairs(_tools) do count = count + 1 end
-  if count > 0 then
+  if count > 1 then   -- >1 because register_tool is always present
     logging.log(string.format("tool_registry: %d tool(s) available.", count))
   end
 end
 
 -- ---------------------------------------------------------------------------
--- register — register a tool table directly (used after AI writes a new one)
+-- register — register a tool table directly
 -- ---------------------------------------------------------------------------
 function M.register(tool)
   if type(tool) ~= "table" or not tool.name or type(tool.run) ~= "function" then
@@ -105,10 +100,10 @@ end
 function M.describe_tools()
   local count = 0
   for _ in pairs(_tools) do count = count + 1 end
-  if count == 0 then
-    return "(No custom tools registered yet. You may create tools by writing a\n" ..
-           "Lua file to the tools/ directory with the tool contract described in\n" ..
-           "tool_registry.lua, then outputting: TOOL_CALL: register_tool | <path>)"
+  -- Don't clutter the prompt if only the built-in meta-tool is present
+  if count <= 1 then
+    return "(No custom tools registered yet. Write a Lua file to tools/ following the\n" ..
+           "tool contract in tool_registry.lua, then call: TOOL_CALL: register_tool | <path>)"
   end
 
   local lines = {
@@ -117,9 +112,11 @@ function M.describe_tools()
     "",
   }
   for name, tool in pairs(_tools) do
-    lines[#lines+1] = string.format("  %-20s — %s", name, tool.description or "")
-    if tool.params then
-      lines[#lines+1] = string.format("    params: %s", tool.params)
+    if name ~= "register_tool" then
+      lines[#lines+1] = string.format("  %-24s — %s", name, tool.description or "")
+      if tool.params then
+        lines[#lines+1] = string.format("    params: %s", tool.params)
+      end
     end
   end
   lines[#lines+1] = ""
@@ -130,13 +127,11 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Built-in meta-tool: register_tool
--- Lets the AI register a newly written .lua tool file at runtime.
 -- ---------------------------------------------------------------------------
 local function builtin_register_tool(params_str)
-  local path = params_str:match("^%s*(.-)%s*$")  -- trim whitespace
-  -- Resolve relative to project path
+  local path = params_str:match("^%s*(.-)%s*$")
   if not path:match("^/") then
-    path = cfg.PROJECT_PATH .. "/../" .. path
+    path = cfg.PROJECT_PATH .. "/" .. path
   end
   local tool = load_tool_file(path)
   if not tool then
@@ -154,8 +149,84 @@ _tools["register_tool"] = {
 }
 
 -- ---------------------------------------------------------------------------
--- process_tool_calls — parse a completed log file for TOOL_CALL lines,
--- run them, and append TOOL_RESULT lines back to the log.
+-- Built-in utility tool: run_shell
+-- Lets the AI run a safe, non-interactive shell command and capture output.
+-- ---------------------------------------------------------------------------
+_tools["run_shell"] = {
+  name        = "run_shell",
+  description = "Run a read-only shell command and return stdout (max 200 lines)",
+  params      = "shell command to execute (avoid commands that mutate files)",
+  run = function(params_str)
+    local cmd = params_str:match("^%s*(.-)%s*$")
+    if cmd == "" then return nil, "run_shell: empty command" end
+    -- Safety: disallow obviously destructive patterns
+    local blocked = { "rm ", "rmdir", "mkfs", "> /", "dd if", ":(){ :|:" }
+    for _, b in ipairs(blocked) do
+      if cmd:lower():find(b, 1, true) then
+        return nil, "run_shell: blocked command pattern: " .. b
+      end
+    end
+    local handle = io.popen(cmd .. " 2>&1 | head -200")
+    if not handle then return nil, "run_shell: popen failed" end
+    local result = handle:read("*a")
+    handle:close()
+    if result == "" then return "(no output)", nil end
+    return result, nil
+  end,
+}
+
+-- ---------------------------------------------------------------------------
+-- Built-in utility tool: grep_project
+-- ---------------------------------------------------------------------------
+_tools["grep_project"] = {
+  name        = "grep_project",
+  description = "Grep for a pattern across all source files in the project",
+  params      = "pattern string to search for",
+  run = function(params_str)
+    local pattern = params_str:match("^%s*(.-)%s*$")
+    if not pattern or pattern == "" then
+      return nil, "grep_project: empty pattern"
+    end
+    pattern = pattern:gsub('"', '\\"')
+    local cmd = string.format(
+      'grep -rn "%s" "%s" --include="*.lua" --include="*.py" --include="*.ts" '
+      .. '--include="*.js" --include="*.rs" --include="*.go" --include="*.cs" '
+      .. '--include="*.cpp" --include="*.c" --include="*.h" '
+      .. '2>/dev/null | grep -v node_modules | grep -v ".git" | head -60',
+      pattern, cfg.PROJECT_PATH)
+    local handle = io.popen(cmd)
+    if not handle then return nil, "grep_project: popen failed" end
+    local result = handle:read("*a")
+    handle:close()
+    if result == "" then return "No matches found for: " .. pattern, nil end
+    return result, nil
+  end,
+}
+
+-- ---------------------------------------------------------------------------
+-- Built-in utility tool: list_files
+-- ---------------------------------------------------------------------------
+_tools["list_files"] = {
+  name        = "list_files",
+  description = "List source files in a directory (relative to PROJECT_PATH)",
+  params      = "relative path from project root (e.g. 'src' or '.')",
+  run = function(params_str)
+    local rel = params_str:match("^%s*(.-)%s*$")
+    if rel == "" then rel = "." end
+    local dir = cfg.PROJECT_PATH .. "/" .. rel
+    local handle = io.popen(string.format(
+      'find "%s" -type f -not -path "*/.git/*" -not -path "*/node_modules/*" 2>/dev/null | head -100',
+      dir))
+    if not handle then return nil, "list_files: popen failed" end
+    local result = handle:read("*a")
+    handle:close()
+    if result == "" then return "(no files found in: " .. rel .. ")", nil end
+    return result:gsub(cfg.PROJECT_PATH .. "/", ""), nil
+  end,
+}
+
+-- ---------------------------------------------------------------------------
+-- process_tool_calls — parse a completed log file for TOOL_CALL lines
 -- ---------------------------------------------------------------------------
 function M.process_tool_calls(log_file, task_num, run_ts)
   local f = io.open(log_file, "r")

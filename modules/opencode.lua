@@ -51,6 +51,7 @@ local function classify_and_print(line)
   local tool_markers = {
     "running tool", "tool result", "● ", "✓ ", "✗ ", "→ ", "⟳ ",
     "calling ", "read_file", "write_file", "bash", "grep", "find",
+    "edit_file", "create_file", "run_command",
   }
   for _, marker in ipairs(tool_markers) do
     if stripped:lower():sub(1, #marker) == marker:lower() then
@@ -66,13 +67,11 @@ end
 -- Internal: stream a subprocess to stdout and log file simultaneously
 -- ---------------------------------------------------------------------------
 local function stream_cmd(cmd, log_file)
-  -- Write command to log for debugging
   local fa = io.open(log_file, "a")
   if fa then fa:write("$ " .. cmd .. "\n"); fa:close() end
 
   reset_think_state()
 
-  -- Use tee-like approach: redirect to log while printing live
   local full_cmd = string.format('%s 2>&1 | tee -a "%s"', cmd, log_file)
   local handle = io.popen(full_cmd)
   if handle then
@@ -106,7 +105,6 @@ local function resolve_session_id(title)
       end
       handle:close()
     end
-    -- small sleep via busy-wait (Lua has no sleep without posix)
     local t = os.time(); while os.time() - t < 1 do end
   end
 
@@ -141,7 +139,6 @@ end
 function M.run_fresh(log_file, prompt, model)
   local title = unique_title()
 
-  -- Write prompt to a temp file to avoid shell escaping issues
   local prompt_file = os.tmpname()
   local pf = io.open(prompt_file, "w")
   if pf then pf:write(prompt); pf:close() end

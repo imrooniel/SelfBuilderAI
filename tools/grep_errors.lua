@@ -1,17 +1,14 @@
 --[[
-  tools/grep_errors.lua — example tool: grep for patterns in project files.
+  tools/grep_errors.lua — grep for patterns in project source files.
 
-  This is an example tool shipped with the suite. It demonstrates the tool
-  contract that the AI must follow when writing new tools.
-
-  Tool contract:
-    Return a table with: name, description, params, run(params_str) → result, err
+  Example tool demonstrating the tool contract.
+  The AI may write new tools following this same pattern.
 ]]
 
 return {
   name        = "grep_errors",
-  description = "Grep for a pattern across all C# files in the project",
-  params      = "pattern string to search for (plain text)",
+  description = "Grep for a pattern across all source files in the project",
+  params      = "pattern string to search for (plain text or basic regex)",
 
   run = function(params_str)
     local cfg = require("config")
@@ -20,11 +17,14 @@ return {
       return nil, "grep_errors: empty pattern"
     end
 
-    -- Sanitize: disallow shell injection via pattern
     pattern = pattern:gsub('"', '\\"')
 
     local cmd = string.format(
-      'grep -rn "%s" "%s/Assets/Scripts" --include="*.cs" 2>/dev/null | head -50',
+      'grep -rn "%s" "%s" '
+      .. '--include="*.lua" --include="*.py" --include="*.ts" --include="*.js" '
+      .. '--include="*.rs" --include="*.go" --include="*.cs" --include="*.cpp" '
+      .. '--include="*.c" --include="*.h" --include="*.java" --include="*.rb" '
+      .. '2>/dev/null | grep -v node_modules | grep -v ".git" | grep -v "__pycache__" | head -50',
       pattern, cfg.PROJECT_PATH)
 
     local handle = io.popen(cmd)
