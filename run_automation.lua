@@ -123,6 +123,12 @@ end
 -- Kernel source path exposed to self_improve (read-only use)
 KERNEL_SOURCE_PATH = BASE_DIR .. "run_automation.lua"
 
+-- Orchestrator directory paths exposed to self_improve so it can tell the
+-- AI exactly where to find and write module files.
+KERNEL_BASE_DIR    = BASE_DIR
+KERNEL_MODULES_DIR = BASE_DIR .. "modules"
+KERNEL_TOOLS_DIR   = BASE_DIR .. "tools"
+
 -- ---------------------------------------------------------------------------
 -- Sanity checks
 -- ---------------------------------------------------------------------------
@@ -183,8 +189,10 @@ end
 -- ---------------------------------------------------------------------------
 -- Single-task runner
 -- ---------------------------------------------------------------------------
-local function run_task(task_num, task_text, all_tasks, model, version, has_sources, run_ts)
+local function run_task(task_num, task_text, all_tasks, model, version, has_sources, run_ts, session_context)
   __refresh_modules()
+
+  session_context = session_context or ""
 
   local slug       = task_slug(task_text)
   local task_start = os.time()
@@ -232,6 +240,7 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
       prior_note      = prior_note,
       version         = version,
       tool_context    = tool_context,
+      session_context = session_context,
     })
 
     local _, current_session = opencode.run_fresh(log_file, prompt, model)
@@ -341,10 +350,11 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
 
         local errors_text = compile.read_errors_raw(compile_error_file)
         local fix_prompt  = prompts.build_fix_prompt({
-          task_num       = task_num,
-          task_text      = task_text,
-          compile_errors = errors_text,
-          version        = version,
+          task_num        = task_num,
+          task_text       = task_text,
+          compile_errors  = errors_text,
+          version         = version,
+          session_context = session_context,
         })
 
         local _, fix_session = opencode.run_fresh(fix_log, fix_prompt, model)
@@ -525,6 +535,85 @@ local function readline_input(prompt)
 end
 
 -- ---------------------------------------------------------------------------
+-- classify_input — heuristic: is this a question/query or an actionable task?
+--
+-- Returns "query" or "task".
+--
+-- A query is something the user wants answered, not built. Strong signals:
+--   • starts with an interrogative word (what, where, why, how, who, when, is,
+--     are, does, do, can, could, should, has, have, show, list, tell, explain)
+--   • ends with a "?"
+--   • contains no imperative verbs that imply file creation/modification
+--     (add, create, implement, write, build, make, refactor, fix, update, delete, etc.)
+--
+-- This is intentionally conservative — ambiguous inputs default to "task" so
+-- the user never loses functionality. They can always prefix with "?" to force
+-- query mode: "? what does X do"
+-- ---------------------------------------------------------------------------
+local QUERY_PREFIXES = {
+  "^what%s", "^where%s", "^why%s", "^how%s", "^who%s", "^when%s",
+  "^is%s", "^are%s", "^was%s", "^were%s",
+  "^does%s", "^do%s", "^did%s",
+  "^can%s", "^could%s", "^should%s", "^would%s",
+  "^has%s", "^have%s", "^had%s",
+  "^show%s+me%s", "^list%s", "^tell%s+me%s", "^explain%s",
+  "^which%s", "^describe%s",
+}
+
+local TASK_VERBS = {
+  "^add%s", "^create%s", "^implement%s", "^write%s", "^build%s",
+  "^make%s", "^refactor%s", "^fix%s", "^update%s", "^delete%s",
+  "^remove%s", "^rename%s", "^move%s", "^generate%s", "^scaffold%s",
+  "^modify%s", "^change%s", "^replace%s", "^convert%s", "^migrate%s",
+  "^setup%s", "^set%s+up%s", "^init%s", "^initialise%s", "^initialize%s",
+}
+
+local function classify_input(input)
+  local s = input:lower():match("^%s*(.-)%s*$")
+
+  -- Explicit query override: user prefixed with "?"
+  if s:sub(1, 1) == "?" then return "query" end
+
+  -- Ends with "?" → almost certainly a question
+  if input:match("%?%s*$") then return "query" end
+
+  -- Strong task signal takes priority over weak query signal
+  for _, pat in ipairs(TASK_VERBS) do
+    if s:match(pat) then return "task" end
+  end
+
+  -- Interrogative opening → query
+  for _, pat in ipairs(QUERY_PREFIXES) do
+    if s:match(pat) then return "query" end
+  end
+
+  return "task"
+end
+
+-- ---------------------------------------------------------------------------
+-- run_query — one-shot Q&A, no Ralph loop, no compile check, no git commit
+-- ---------------------------------------------------------------------------
+local function run_query(question, model, version, run_ts, session_context)
+  -- Strip leading "?" override prefix if present
+  local clean = question:match("^%s*%?%s*(.-)%s*$") or question
+
+  logging.step("QUERY", clean:sub(1, 60))
+
+  os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. '/logs"')
+  local log_file = string.format("%s/logs/query-%s.log",
+    cfg.PROJECT_PATH, run_ts)
+
+  local prompt = prompts.build_query_prompt({
+    question        = clean,
+    version         = version,
+    session_context = session_context or "",
+  })
+
+  opencode.run_fresh(log_file, prompt, model)
+  print()
+end
+
+-- ---------------------------------------------------------------------------
 -- Interactive REPL
 -- ---------------------------------------------------------------------------
 local function run_interactive_loop(model, version, has_sources, branch_name)
@@ -533,8 +622,9 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
   logging.header("============================================")
   logging.header("Interactive mode  (no todo.md found)")
   logging.header(string.format("Project type: %s | Tech: %s", cfg.PROJECT_TYPE, tech))
-  logging.header("Describe what you want built, one task at a time.")
+  logging.header("Ask a question or describe what you want built.")
   logging.header("Tips: ↑/↓ history  |  Ctrl-R search  |  \\ to continue on next line")
+  logging.header("Prefix input with ? to force question mode (no file writes).")
   logging.header("Type  quit  or  exit  (or Ctrl-D) to end the session.")
   logging.header("============================================")
   print()
@@ -544,13 +634,37 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
   local tasks_failed  = 0
   local failed_labels = {}
   local run_ts        = os.date("%Y%m%d-%H%M%S")
-  local prompt        = logging.bold_white("\n> What should I build? ")
+  local prompt        = logging.bold_white("\n> ")
+
+  -- Session journal: an ordered list of records describing what has been done.
+  -- Each entry is a plain string injected verbatim into every subsequent prompt
+  -- so the model always knows what already exists in the project.
+  -- Format: "Task #N [status]: <description> → files: <list>"
+  local journal = {}
+
+  -- Build the session_context string from accumulated journal entries.
+  -- Returns "" when the journal is empty (first task — no history yet).
+  local function session_context()
+    if #journal == 0 then return "" end
+    return table.concat(journal, "\n")
+  end
+
+  -- Record a completed task in the journal, including which files changed.
+  local function journal_record(num, text, status, changed_files)
+    local files_str = #changed_files > 0
+      and table.concat(changed_files, ", ")
+      or  "no files changed"
+    -- Strip PROJECT_PATH prefix from file paths for readability
+    files_str = files_str:gsub(cfg.PROJECT_PATH .. "/", "")
+    journal[#journal+1] = string.format(
+      "Task #%s [%s]: %s → files: %s", num, status, text, files_str)
+  end
 
   while true do
     local input = readline_input(prompt)
     if not input then break end
     if input == "" then
-      logging.warn("Empty input — please describe a task, or type 'quit' to exit.")
+      logging.warn("Empty input — describe a task, ask a question, or type 'quit' to exit.")
       goto continue
     end
     if input:lower() == "quit" or input:lower() == "exit" then break end
@@ -562,24 +676,38 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
       goto continue
     end
     if input:lower() == "help" then
-      print("Commands: status | quit | exit | any task description")
+      print("Commands: status | quit | exit")
+      print("Tasks  : describe what to build/fix/add — Ralph will write files.")
+      print("Queries: ask a question (starts with interrogative, ends with ?, or prefix with ?).")
+      print("         Queries get a direct answer; no files are written.")
       goto continue
     end
 
-    task_counter = task_counter + 1
+    -- Classify: question/query vs. actionable task
+    local intent = classify_input(input)
 
-    local success = run_task(task_counter, input, nil, model, version, has_sources, run_ts)
-
-    if success then
-      tasks_done = tasks_done + 1
-      logging.ok("Task complete. What's next?")
+    if intent == "query" then
+      run_query(input, model, version, run_ts, session_context())
     else
-      tasks_failed = tasks_failed + 1
-      failed_labels[#failed_labels+1] = tostring(task_counter) .. "(" .. input:sub(1,30) .. ")"
-      logging.warn("Task did not complete. You can rephrase and try again.")
+      task_counter = task_counter + 1
+      local before = git_utils.snapshot_files()
+      local success = run_task(task_counter, input, nil, model, version, has_sources, run_ts, session_context())
+      local changed = git_utils.files_changed_since(before)
+
+      if success then
+        tasks_done = tasks_done + 1
+        journal_record(task_counter, input, "done", changed)
+        logging.ok("Task complete. What's next?")
+      else
+        tasks_failed = tasks_failed + 1
+        journal_record(task_counter, input, "FAILED", changed)
+        failed_labels[#failed_labels+1] = tostring(task_counter) .. "(" .. input:sub(1,30) .. ")"
+        logging.warn("Task did not complete. You can rephrase and try again.")
+      end
+
+      __refresh_modules()
     end
 
-    __refresh_modules()
     run_ts = os.date("%Y%m%d-%H%M%S")
 
     ::continue::
@@ -684,18 +812,27 @@ local function main()
     local selected = todo_parser.select_tasks(unchecked)
     logging.log(string.format("Running %d task(s).", #selected))
 
-    local run_ts      = os.date("%Y%m%d-%H%M%S")
-    local tasks_done  = 0
+    local run_ts       = os.date("%Y%m%d-%H%M%S")
+    local tasks_done   = 0
     local tasks_failed = 0
-    local failed_nums = {}
+    local failed_nums  = {}
+    local journal      = {}   -- same in-session context mechanism as interactive mode
 
     for _, task in ipairs(selected) do
-      local success = run_task(task.num, task.text, all_tasks, model, version, has_sources, run_ts)
+      local ctx = #journal > 0 and table.concat(journal, "\n") or ""
+      local before = git_utils.snapshot_files()
+      local success = run_task(task.num, task.text, all_tasks, model, version, has_sources, run_ts, ctx)
+      local changed = git_utils.files_changed_since(before)
+      local files_str = #changed > 0
+        and table.concat(changed, ", "):gsub(cfg.PROJECT_PATH .. "/", "")
+        or  "no files changed"
       if success then
         tasks_done = tasks_done + 1
+        journal[#journal+1] = string.format("Task #%s [done]: %s → files: %s", task.num, task.text, files_str)
       else
         tasks_failed = tasks_failed + 1
         failed_nums[#failed_nums+1] = task.num
+        journal[#journal+1] = string.format("Task #%s [FAILED]: %s → files: %s", task.num, task.text, files_str)
       end
     end
 

@@ -274,6 +274,7 @@ local MAX_SOURCE_CHARS = 24000   -- ~6k tokens
 
 function M.build_self_improve_prompt(opts)
   local mod_name       = opts.mod_name
+  local mod_path       = opts.mod_path or ("modules/" .. mod_name .. ".lua")
   local current_source = opts.current_source or ""
   local reason         = opts.reason or "general"
   local context_str    = opts.context_str or ""
@@ -291,6 +292,13 @@ function M.build_self_improve_prompt(opts)
   return string.format([[
 You are an expert Lua developer improving a programming automation system.
 
+## IMPORTANT — file locations
+This is an orchestration system, NOT the project being built.
+The module you are improving is at: %s
+The entry point is: %s
+Other modules are in the same directory as the module above.
+Do NOT look in src/, scripts/, or PROJECT_PATH for these files.
+
 Reason: %s
 Context: %s
 
@@ -302,15 +310,17 @@ Context: %s
 %s
 ```
 
-Rewrite to fix the problem above. Rules:
+Rewrite to fix the problem described above. Rules:
   1. Return ONLY valid Lua 5.4 — no markdown, no backticks.
   2. Module must return table M.
   3. Do not remove functionality.
   4. Keep all function signatures compatible.
   5. If nothing needs changing, return source UNCHANGED.
 
-Output the complete Lua source now.
+Output the complete Lua source now, starting with the module header comment.
 ]],
+    mod_path,
+    _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
     reason, context_str, progress, mod_name, current_source)
 end
 

@@ -24,6 +24,30 @@ local opencode   = require("opencode")
 local prompts    = require("prompts")
 
 -- ---------------------------------------------------------------------------
+-- Helper: resolve the orchestrator's modules directory.
+-- Prefer the kernel global set by run_automation.lua; fall back to deriving
+-- it from package.path so the module works in test contexts too.
+-- ---------------------------------------------------------------------------
+local function modules_dir()
+  if _G.KERNEL_MODULES_DIR then return _G.KERNEL_MODULES_DIR end
+  -- Derive from package.path: find the first template that resolves a known module
+  for template in package.path:gmatch("[^;]+") do
+    local candidate = template:gsub("%?", "config")
+    local fh = io.open(candidate, "r")
+    if fh then
+      fh:close()
+      -- Strip "config.lua" to get the directory
+      return candidate:match("(.+)/config%.lua$") or "."
+    end
+  end
+  return "."
+end
+
+local function module_path(mod_name)
+  return modules_dir() .. "/" .. mod_name .. ".lua"
+end
+
+-- ---------------------------------------------------------------------------
 -- Helper: read a file
 -- ---------------------------------------------------------------------------
 local function read_file(path)
@@ -151,6 +175,7 @@ function M.run_targeted(model, reason, context)
 
     local prompt_text = prompts.build_self_improve_prompt({
       mod_name       = mod_name,
+      mod_path       = module_path(mod_name),
       current_source = current_source,
       reason         = reason,
       context_str    = tostring(context.task_num or "") .. ": " ..
@@ -185,14 +210,24 @@ function M.run_proactive(model, session_summary)
 
   local sources_block = {}
   for _, name in ipairs(module_names) do
-    local src = hot_reload.source(name) or ""
+    local src  = hot_reload.source(name) or ""
+    local path = module_path(name)
     sources_block[#sources_block+1] = string.format(
-      "=== %s ===\n%s\n", name, src:sub(1, 3000))
+      "=== %s ===\nPath: %s\n%s\n", name, path, src:sub(1, 3000))
   end
+
+  local mdir = modules_dir()
 
   local prompt = string.format([[
 You are an expert Lua developer improving a programming automation orchestration system.
 This is the end-of-session proactive improvement pass.
+
+## IMPORTANT — file locations
+This is an orchestration system, NOT the project being built.
+Module files are in: %s
+Entry point: %s
+Do NOT look in src/, scripts/, or PROJECT_PATH for these files.
+Each module block below includes its exact path.
 
 ## Session summary
 Tasks done   : %d
@@ -200,7 +235,7 @@ Tasks failed : %d
 Failed tasks : %s
 Project type : %s
 
-## Cross-task learnings (progress.txt)
+## Recent progress
 %s
 
 ## All module sources
@@ -226,6 +261,8 @@ Rules:
 
 After all rewrites (or NO_IMPROVEMENTS_NEEDED), output: DONE
 ]],
+    mdir,
+    _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
     session_summary.tasks_done   or 0,
     session_summary.tasks_failed or 0,
     table.concat(session_summary.failed_nums or {}, ", "),
@@ -270,6 +307,12 @@ function M.suggest_kernel_improvements(model, context)
   local prompt = string.format([[
 You are an expert Lua developer reviewing an orchestration system kernel.
 
+## IMPORTANT — file locations
+This is an orchestration system, NOT the project being built.
+Kernel entry point : %s
+Modules directory  : %s
+Do NOT look in src/, scripts/, or PROJECT_PATH for these files.
+
 IMPORTANT: You are NOT rewriting this file. You are writing SUGGESTIONS ONLY
 for the human developer to review and apply manually.
 
@@ -278,7 +321,7 @@ Task #%s: %s
 What went wrong: %s
 Project type: %s
 
-## Cross-task learnings (progress.txt)
+## Recent progress
 %s
 
 ## Kernel source (run_automation.lua) — current version: %s
@@ -298,6 +341,8 @@ Format each suggestion as:
 
 After all suggestions, output: DONE
 ]],
+    kernel_src_path,
+    modules_dir(),
     context.task_num   or "?",
     context.task_text  or "?",
     context.prior_note or "unknown",
