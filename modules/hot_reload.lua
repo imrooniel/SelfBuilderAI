@@ -70,10 +70,15 @@ function M.reload(name)
   local f = io.open(path, "r")
   if f then new_source = f:read("*a"); f:close() end
 
+  -- Clear the loader cache so require() will re-execute the file
   package.loaded[name] = nil
 
   local ok, result = pcall(require, name)
   if not ok then
+    -- Rollback: clear any broken partial table Lua may have cached during the
+    -- failed load, then restore the known-good module so future require() calls
+    -- return the working version.
+    package.loaded[name] = nil
     package.loaded[name] = entry.mod
     return nil, "reload failed (rolled back): " .. tostring(result)
   end
@@ -126,6 +131,10 @@ function M.write_and_reload(name, new_source)
   if not f then return false, "cannot write temp file: " .. tmp end
   f:write(new_source); f:close()
 
+  -- Validate syntax via temp file.
+  -- NOTE: loadfile only catches parse/syntax errors. A module with a runtime
+  -- error at the top level (e.g. a bad require()) will pass this check and then
+  -- fail during reload below, which triggers the rollback path correctly.
   local chunk, load_err = loadfile(tmp)
   if not chunk then
     os.remove(tmp)

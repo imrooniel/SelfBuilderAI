@@ -119,13 +119,18 @@ local function resolve_session_id(title)
 end
 
 -- ---------------------------------------------------------------------------
--- log_says_done — detect DONE line in log
+-- log_says_done — detect DONE line in log.
+-- Strips ANSI escape sequences and carriage returns before matching so that
+-- terminal colouring or Windows-style line endings cannot prevent detection.
 -- ---------------------------------------------------------------------------
 function M.log_says_done(log_path)
   local f = io.open(log_path, "r")
   if not f then return false end
   for line in f:lines() do
-    if line:match("^DONE%s*$") then
+    -- Strip ANSI CSI sequences (\027[...m) and bare \r
+    local clean = line:gsub("\027%[[%d;]*%a", ""):gsub("\r", "")
+    -- Trim leading/trailing whitespace then check for exact DONE
+    if clean:match("^%s*DONE%s*$") then
       f:close(); return true
     end
   end

@@ -208,7 +208,6 @@ function M.select_model()
     logging.err("Invalid selection: '" .. tostring(choice) .. "'"); os.exit(1)
   end
 
-  -- Normalize: strip provider prefix for ollama models to match opencode CLI expectation
   local selected = models[idx]
   logging.log("Using model: " .. selected)
   return selected

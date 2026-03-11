@@ -32,7 +32,8 @@ end
 -- ---------------------------------------------------------------------------
 function M.is_git_repo()
   local _, ok = git("rev-parse --git-dir", false)
-  return ok == true or ok == 0
+  -- io.popen handle:close() returns true on success (exit 0), not the integer 0
+  return ok == true
 end
 
 -- ---------------------------------------------------------------------------
@@ -118,9 +119,21 @@ function M.snapshot_files()
     and "\\( " .. table.concat(skip_parts, " -o ") .. " \\) -o"
     or ""
 
+  -- Portable mtime: try GNU stat first, fall back to BSD stat (macOS)
+  -- GNU: stat -c "%Y %n"   BSD: stat -f "%m %N"
+  local stat_cmd
+  local test_handle = io.popen("stat --version 2>/dev/null")
+  local stat_out = test_handle and test_handle:read("*l") or ""
+  if test_handle then test_handle:close() end
+  if stat_out:find("GNU") then
+    stat_cmd = 'xargs -0 stat -c "%Y %n" 2>/dev/null'
+  else
+    stat_cmd = 'xargs -0 stat -f "%m %N" 2>/dev/null'
+  end
+
   local cmd = string.format(
-    'find "%s" %s \\( %s \\) -print0 2>/dev/null | xargs -0 stat -c "%%Y %%n" 2>/dev/null',
-    cfg.PROJECT_PATH, skip_expr, ext_filter)
+    'find "%s" %s \\( %s \\) -print0 2>/dev/null | %s',
+    cfg.PROJECT_PATH, skip_expr, ext_filter, stat_cmd)
 
   local handle = io.popen(cmd)
   if handle then

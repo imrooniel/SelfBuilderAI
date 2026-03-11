@@ -30,39 +30,21 @@ function M.run_compile_check(error_out)
   if profile.compile then
     logging.log(string.format(
       "Compile check [%s] — running...", cfg.PROJECT_TYPE))
-    local ok, err_text = pcall(function()
-      return profile.compile(cfg)
-    end)
-    if not ok then
+    local compile_result = { pcall(profile.compile, cfg) }
+    if not compile_result[1] then
       -- pcall caught a Lua error in the compile function itself
       local fa = io.open(error_out, "a")
-      if fa then fa:write("ERROR: compile layer crashed: " .. tostring(err_text) .. "\n"); fa:close() end
+      if fa then fa:write("ERROR: compile layer crashed: " .. tostring(compile_result[2]) .. "\n"); fa:close() end
     else
-      -- ok here is the bool, err_text is the error output
-      local compile_ok, compile_errors = err_text, select(2, profile.compile(cfg))
-      -- Re-run cleanly (pcall above already ran it; run again to get both return values)
-      local ok2, errors2
-      local success2, result2 = pcall(profile.compile, cfg)
-      if success2 then
-        ok2 = result2
-        -- compile returns two values but pcall only captures the first. Use a wrapper.
-      end
-      -- Simpler: just call directly with pcall-wrapping for crash safety
-      local compile_result = { pcall(profile.compile, cfg) }
-      if not compile_result[1] then
+      local layer_ok     = compile_result[2]
+      local layer_errors = compile_result[3] or ""
+      if not layer_ok and layer_errors ~= "" then
         local fa = io.open(error_out, "a")
-        if fa then fa:write("ERROR: compile layer crashed: " .. tostring(compile_result[2]) .. "\n"); fa:close() end
-      else
-        local layer_ok    = compile_result[2]
-        local layer_errors = compile_result[3] or ""
-        if not layer_ok and layer_errors ~= "" then
-          local fa = io.open(error_out, "a")
-          if fa then
-            for line in (layer_errors .. "\n"):gmatch("([^\n]*)\n") do
-              if line ~= "" then fa:write("ERROR: " .. line .. "\n") end
-            end
-            fa:close()
+        if fa then
+          for line in (layer_errors .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then fa:write("ERROR: " .. line .. "\n") end
           end
+          fa:close()
         end
       end
     end
@@ -72,6 +54,8 @@ function M.run_compile_check(error_out)
   end
 
   -- Layer 2: static analysis / check
+  -- Failures are written as ERROR: lines and ARE blocking. Set profile.check = nil
+  -- in project_type.lua to make a check layer advisory-only for a given project type.
   if profile.check then
     logging.log("Running secondary check pass...")
     local check_result = { pcall(profile.check, cfg) }
@@ -87,7 +71,7 @@ function M.run_compile_check(error_out)
         local fa = io.open(error_out, "a")
         if fa then
           for line in (layer_errors .. "\n"):gmatch("([^\n]*)\n") do
-            if line ~= "" then fa:write("WARNING: " .. line .. "\n") end
+            if line ~= "" then fa:write("ERROR: " .. line .. "\n") end
           end
           fa:close()
         end

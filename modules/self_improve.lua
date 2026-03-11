@@ -46,12 +46,39 @@ local function run_improve_call(model, prompt, log_path)
 
   local log_content = read_file(log_path)
 
-  -- Try to find a clean Lua block (starts with --[[ or --, ends with return M)
-  local src = log_content:match("(%-%-[^\n]*\n.+return%s+M[^\n]*)")
-  if not src then
-    src = log_content:match("(%-%-[^\n]*\n.+)")
+  -- Extract the Lua source block. The model is instructed to return raw Lua
+  -- with no markdown fences, starting with a comment header and ending with
+  -- "return M". We scan line-by-line to find the first line that looks like
+  -- a Lua module header and capture everything through the last "return M".
+  --
+  -- Strategy: collect all lines between the first ^--[[ or ^-- header and the
+  -- last occurrence of a line matching ^return M, inclusive.
+  local lines = {}
+  for line in (log_content .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines+1] = line
   end
-  return src
+
+  local start_idx = nil
+  local end_idx   = nil
+
+  for i, line in ipairs(lines) do
+    if start_idx == nil and (line:match("^%-%-%[%[") or line:match("^%-%- ")) then
+      start_idx = i
+    end
+    if line:match("^return%s+M") then
+      end_idx = i   -- keep updating so we get the LAST occurrence
+    end
+  end
+
+  if not start_idx or not end_idx or end_idx < start_idx then
+    return nil
+  end
+
+  local extracted = {}
+  for i = start_idx, end_idx do
+    extracted[#extracted+1] = lines[i]
+  end
+  return table.concat(extracted, "\n")
 end
 
 -- ---------------------------------------------------------------------------
@@ -107,8 +134,20 @@ function M.run_targeted(model, reason, context)
   local run_ts   = os.date("%Y%m%d-%H%M%S")
 
   for _, mod_name in ipairs(targets) do
-    local current_source = hot_reload.source(mod_name) or
-                           read_file(cfg.PROJECT_PATH .. "/../modules/" .. mod_name .. ".lua")
+    -- Prefer the live source tracked by hot_reload; fall back to reading from
+    -- disk by resolving through package.path (same mechanism hot_reload uses).
+    local current_source = hot_reload.source(mod_name)
+    if not current_source then
+      for template in package.path:gmatch("[^;]+") do
+        local candidate = template:gsub("%?", mod_name)
+        local fh = io.open(candidate, "r")
+        if fh then
+          current_source = fh:read("*a"); fh:close()
+          break
+        end
+      end
+    end
+    current_source = current_source or "(source not found)"
 
     local prompt_text = prompts.build_self_improve_prompt({
       mod_name       = mod_name,
@@ -214,7 +253,17 @@ end
 function M.suggest_kernel_improvements(model, context)
   logging.log("[self_improve] Kernel suggestion pass (read-only)...")
 
-  local kernel_source = read_file(KERNEL_SOURCE_PATH)   -- global set by kernel
+  -- These globals are set by run_automation.lua (the kernel). Access via _G
+  -- explicitly so any missing-global errors are loud rather than silent nils.
+  local kernel_src_path = _G.KERNEL_SOURCE_PATH
+  local kernel_version  = _G.KERNEL_VERSION
+
+  if not kernel_src_path then
+    logging.warn("[self_improve] KERNEL_SOURCE_PATH not set — skipping kernel suggestion pass.")
+    return
+  end
+
+  local kernel_source = read_file(kernel_src_path)
   local progress      = read_progress()
   local run_ts        = os.date("%Y%m%d-%H%M%S")
 
@@ -254,7 +303,7 @@ After all suggestions, output: DONE
     context.prior_note or "unknown",
     cfg.PROJECT_TYPE,
     progress,
-    KERNEL_VERSION,
+    kernel_version or "unknown",
     kernel_source)
 
   os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. '/logs"')
@@ -275,7 +324,7 @@ After all suggestions, output: DONE
     if fa then
       fa:write(string.format(
         "\n\n---\n## Session: %s | Kernel v%s | Task #%s | Type: %s\n%s\n",
-        ts, KERNEL_VERSION, context.task_num or "?", cfg.PROJECT_TYPE, suggestions))
+        ts, kernel_version or "unknown", context.task_num or "?", cfg.PROJECT_TYPE, suggestions))
       fa:close()
       logging.ok("[self_improve] Kernel suggestions written to " .. cfg.KERNEL_SUGGESTIONS)
     end

@@ -84,18 +84,34 @@ function M.mark_task_done(task_num, task_text)
   local path    = cfg.PROJECT_PATH .. "/todo.md"
   local f       = io.open(path, "r")
   if not f then return end
-  local content = f:read("*a"); f:close()
+  local lines   = {}
+  for line in f:lines() do lines[#lines+1] = line end
+  f:close()
 
   local escaped = task_text:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
-  local pattern = "(" .. task_num .. "%.%s+%[)%s(%]%s+" .. escaped .. ")"
-  local new_content, n = content:gsub(pattern, "%1x%2")
-  if n == 0 then
+  -- Anchor to line start (^) and match the exact task number followed by a dot
+  -- to prevent task "1" matching inside "10", "11", etc.
+  local pattern = "^(" .. task_num .. "%.%s+%[)%s(%]%s+" .. escaped .. ")"
+  local matched = false
+  for i, line in ipairs(lines) do
+    local new_line, n = line:gsub(pattern, "%1x%2")
+    if n > 0 then
+      lines[i] = new_line
+      matched = true
+      break
+    end
+  end
+
+  if not matched then
     logging.warn("mark_task_done: pattern not matched for task #" .. task_num)
     return
   end
 
   local fw = io.open(path, "w")
-  if fw then fw:write(new_content); fw:close() end
+  if fw then
+    fw:write(table.concat(lines, "\n") .. "\n")
+    fw:close()
+  end
   logging.log("Marked #" .. task_num .. " as done in todo.md")
 end
 

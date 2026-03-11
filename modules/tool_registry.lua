@@ -150,7 +150,12 @@ _tools["register_tool"] = {
 
 -- ---------------------------------------------------------------------------
 -- Built-in utility tool: run_shell
--- Lets the AI run a safe, non-interactive shell command and capture output.
+-- Lets the AI run read-only shell commands and capture output.
+--
+-- SECURITY NOTE: This is a best-effort safety layer, not a sandbox. It blocks
+-- common destructive patterns but cannot enumerate every dangerous invocation.
+-- Do not rely on this for untrusted input. For stronger isolation, run the
+-- entire Lua process inside a container or bubblewrap sandbox.
 -- ---------------------------------------------------------------------------
 _tools["run_shell"] = {
   name        = "run_shell",
@@ -159,13 +164,34 @@ _tools["run_shell"] = {
   run = function(params_str)
     local cmd = params_str:match("^%s*(.-)%s*$")
     if cmd == "" then return nil, "run_shell: empty command" end
-    -- Safety: disallow obviously destructive patterns
-    local blocked = { "rm ", "rmdir", "mkfs", "> /", "dd if", ":(){ :|:" }
-    for _, b in ipairs(blocked) do
-      if cmd:lower():find(b, 1, true) then
-        return nil, "run_shell: blocked command pattern: " .. b
+
+    -- Denylist: block obviously destructive or escape-prone patterns.
+    -- This is NOT exhaustive — it catches common accidents, not adversarial input.
+    local blocked_patterns = {
+      -- Destructive filesystem ops
+      "rm%s", "rmdir%s", "unlink%s", "shred%s",
+      "mkfs", "fdisk", "dd%s",
+      -- Privilege escalation
+      "sudo%s", "su%s", "pkexec",
+      -- Execution of arbitrary code
+      "curl%s.-%|", "wget%s.-%|",   -- pipe-to-shell download patterns
+      "python%d?%s+-c%s", "perl%s+-e%s", "ruby%s+-e%s",
+      "bash%s+-c%s", "sh%s+-c%s", "zsh%s+-c%s",
+      "eval%s", "exec%s",
+      -- Redirect to sensitive paths
+      ">%s*/",
+      -- Fork bomb skeleton
+      ":%(%){",
+      -- Sensitive env / credential access
+      "%.aws/", "%.ssh/", "%.gnupg/",
+    }
+    local cmd_lower = cmd:lower()
+    for _, pat in ipairs(blocked_patterns) do
+      if cmd_lower:find(pat) then
+        return nil, "run_shell: blocked pattern '" .. pat .. "' in command"
       end
     end
+
     local handle = io.popen(cmd .. " 2>&1 | head -200")
     if not handle then return nil, "run_shell: popen failed" end
     local result = handle:read("*a")

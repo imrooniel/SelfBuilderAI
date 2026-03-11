@@ -69,6 +69,7 @@ function M.build_task_prompt(opts)
   local prior_note      = opts.prior_note or "No details recorded."
   local version         = opts.version or "unknown"
   local tool_context    = opts.tool_context or ""
+  local session_context = opts.session_context or ""
 
   local tech     = project_type.get_tech(cfg)
   local src_dirs = project_type.get_src_dirs(cfg)
@@ -133,6 +134,13 @@ Create the file NOW using write_file or a shell command.
 ]]
   end
 
+  -- Build session history block (empty string = omit section entirely)
+  local session_block = ""
+  if session_context ~= "" then
+    session_block = "## What has been built in this session (read before writing anything)\n"
+      .. session_context .. "\n"
+  end
+
   return string.format([[
 You are a %s developer. Your job is to write code, not explore.
 
@@ -159,7 +167,7 @@ Version: %s
 %s
 %s
 %s
-
+%s
 ## Section context (other tasks in this batch for coherence)
 %s
 
@@ -184,6 +192,7 @@ Version: %s
     retry_block,
     type_hints,
     tool_context,
+    session_block,
     section_context,
     task_num,
     task_text,
@@ -200,8 +209,14 @@ function M.build_fix_prompt(opts)
   local task_text      = opts.task_text
   local compile_errors = opts.compile_errors or ""
   local version        = opts.version or "unknown"
+  local session_context = opts.session_context or ""
 
   local tech = project_type.get_tech(cfg)
+
+  local session_block = ""
+  if session_context ~= "" then
+    session_block = "## What has been built in this session\n" .. session_context .. "\n"
+  end
 
   return string.format([[
 You are a %s developer. Fix compile/check errors — do not explore.
@@ -215,7 +230,7 @@ You are a %s developer. Fix compile/check errors — do not explore.
 ## Read these first (one call each):
 - %s/%s
 - %s/%s
-
+%s
 ## Task that was implemented
 #%s: %s
 
@@ -235,6 +250,7 @@ You are a %s developer. Fix compile/check errors — do not explore.
     tech,
     cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE,
+    session_block,
     task_num, task_text,
     compile_errors,
     existing_sources_list(),
@@ -245,12 +261,20 @@ end
 -- ---------------------------------------------------------------------------
 -- build_self_improve_prompt
 -- ---------------------------------------------------------------------------
+local MAX_SOURCE_CHARS = 24000   -- ~6k tokens; keeps us well inside context limits
+
 function M.build_self_improve_prompt(opts)
   local mod_name       = opts.mod_name
   local current_source = opts.current_source or ""
   local reason         = opts.reason or "general"
   local context_str    = opts.context_str or ""
   local progress       = opts.progress or ""
+
+  -- Guard: truncate oversized sources with a visible marker so the model knows
+  if #current_source > MAX_SOURCE_CHARS then
+    current_source = current_source:sub(1, MAX_SOURCE_CHARS)
+      .. "\n\n-- [SOURCE TRUNCATED FOR CONTEXT — " .. #(opts.current_source) .. " chars total]\n"
+  end
 
   return string.format([[
 You are an expert Lua developer improving a programming automation orchestration system.
@@ -282,8 +306,56 @@ Output the complete new Lua source now, starting with the module header comment.
 end
 
 -- ---------------------------------------------------------------------------
--- Nudge prompts — varied so a stalled model gets a different angle each time
+-- build_query_prompt — lightweight one-shot Q&A (no file writing expected)
 -- ---------------------------------------------------------------------------
+function M.build_query_prompt(opts)
+  local question        = opts.question or ""
+  local version         = opts.version  or "unknown"
+  local session_context = opts.session_context or ""
+  local tech     = project_type.get_tech(cfg)
+  local src_dirs = project_type.get_src_dirs(cfg)
+
+  local dir_lines = {}
+  for _, d in ipairs(src_dirs) do
+    dir_lines[#dir_lines+1] = "- " .. cfg.PROJECT_PATH .. "/" .. d
+  end
+
+  local session_block = ""
+  if session_context ~= "" then
+    session_block = "## What has been built in this session\n" .. session_context .. "\n"
+  end
+
+  return string.format([[
+You are a %s developer assistant. Answer the question below concisely.
+
+## Project
+Path: %s
+Technology: %s
+Version: %s
+
+## Source layout
+%s
+
+## Existing files (for context)
+%s
+%s
+## Question
+%s
+
+## Rules
+- Answer directly. Do NOT write or modify any files unless explicitly asked.
+- Do NOT output DONE.
+- Keep your answer concise and focused.
+]],
+    tech,
+    cfg.PROJECT_PATH,
+    tech,
+    version,
+    table.concat(dir_lines, "\n"),
+    existing_sources_list(),
+    session_block,
+    question)
+end
 local _NUDGE_PROMPTS = {
   "You appear to have stopped mid-task. Continue from where you left off "
     .. "and write the remaining file(s). Output DONE on its own line when complete.",
