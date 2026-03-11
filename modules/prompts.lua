@@ -357,8 +357,53 @@ Do not write or modify files. Do not output DONE.
 end
 
 -- ---------------------------------------------------------------------------
--- Nudge prompts — varied so a stalled model gets a different angle each time
+-- build_classify_prompt — intent classification for REPL input.
+-- The model must respond with exactly one token on the first line:
+--   TASK        — build/write/fix/modify something in the project
+--   SELF_IMPROVE — improve the orchestration system (Ralph) itself
+--   QUERY       — answer a question, no file writes needed
+-- Optionally followed by a second line:
+--   MODULE: <name>   (only for SELF_IMPROVE, if a specific module is named)
 -- ---------------------------------------------------------------------------
+function M.build_classify_prompt(opts)
+  local input           = opts.input or ""
+  local tech            = project_type.get_tech(cfg)
+  local session_context = opts.session_context or ""
+
+  local known_mods = "config, logging, session, todo_parser, git_utils, compile, "
+    .. "prompts, opencode, hot_reload, tool_registry, self_improve, project_type"
+
+  local session_block = session_context ~= ""
+    and ("Recent session activity:\n" .. session_context .. "\n\n")
+    or  ""
+
+  return string.format([[
+You are classifying user input for a programming automation tool called Ralph.
+Ralph has two distinct contexts:
+
+1. THE PROJECT: %s code being built at %s
+2. THE ORCHESTRATOR: Ralph's own Lua modules at %s
+   Known modules: %s
+
+%sClassify the following input into exactly one category:
+
+  TASK         — user wants to build, write, fix, or modify something in THE PROJECT
+  SELF_IMPROVE — user wants to improve THE ORCHESTRATOR (Ralph itself, its modules, its behaviour, its prompts, etc.)
+  QUERY        — user wants an answer to a question; no files should be written
+
+If SELF_IMPROVE and a specific module name is mentioned or clearly implied, add a second line:
+  MODULE: <module_name>
+
+Respond with ONLY the category (and optional MODULE line). No explanation.
+
+Input: %s
+]],
+    tech, cfg.PROJECT_PATH,
+    _G.KERNEL_MODULES_DIR or "modules/",
+    known_mods,
+    session_block,
+    input)
+end
 local _NUDGE_PROMPTS = {
   "You appear to have stopped mid-task. Continue from where you left off "
     .. "and write the remaining file(s). Output DONE on its own line when complete.",

@@ -535,59 +535,100 @@ local function readline_input(prompt)
 end
 
 -- ---------------------------------------------------------------------------
--- classify_input — heuristic: is this a question/query or an actionable task?
+-- classify_input — AI-powered intent classifier.
 --
--- Returns "query" or "task".
+-- Returns: intent ("task" | "self_improve" | "query"), module_target (or nil)
 --
--- A query is something the user wants answered, not built. Strong signals:
---   • starts with an interrogative word (what, where, why, how, who, when, is,
---     are, does, do, can, could, should, has, have, show, list, tell, explain)
---   • ends with a "?"
---   • contains no imperative verbs that imply file creation/modification
---     (add, create, implement, write, build, make, refactor, fix, update, delete, etc.)
---
--- This is intentionally conservative — ambiguous inputs default to "task" so
--- the user never loses functionality. They can always prefix with "?" to force
--- query mode: "? what does X do"
+-- Fast-path: a small set of unambiguous regex patterns are checked first so
+-- trivially obvious inputs (bare "?" prefix, trailing "?") don't pay the cost
+-- of an LLM call. Everything else goes to the model.
 -- ---------------------------------------------------------------------------
-local QUERY_PREFIXES = {
-  "^what%s", "^where%s", "^why%s", "^how%s", "^who%s", "^when%s",
-  "^is%s", "^are%s", "^was%s", "^were%s",
-  "^does%s", "^do%s", "^did%s",
-  "^can%s", "^could%s", "^should%s", "^would%s",
-  "^has%s", "^have%s", "^had%s",
-  "^show%s+me%s", "^list%s", "^tell%s+me%s", "^explain%s",
-  "^which%s", "^describe%s",
-}
 
-local TASK_VERBS = {
-  "^add%s", "^create%s", "^implement%s", "^write%s", "^build%s",
-  "^make%s", "^refactor%s", "^fix%s", "^update%s", "^delete%s",
-  "^remove%s", "^rename%s", "^move%s", "^generate%s", "^scaffold%s",
-  "^modify%s", "^change%s", "^replace%s", "^convert%s", "^migrate%s",
-  "^setup%s", "^set%s+up%s", "^init%s", "^initialise%s", "^initialize%s",
-}
+-- Unambiguous fast-path patterns — only used for cases where no reasonable
+-- human would mean anything other than what the pattern says.
+local function fast_classify(s)
+  -- Explicit query override prefix
+  if s:sub(1, 1) == "?" then return "query", nil end
+  -- Bare question mark ending with no task verb
+  if s:match("%?%s*$") and not s:match("^%a+%s") then return "query", nil end
+  return nil, nil  -- not obvious — use AI
+end
 
-local function classify_input(input)
+local function classify_input(input, model, session_ctx)
   local s = input:lower():match("^%s*(.-)%s*$")
 
-  -- Explicit query override: user prefixed with "?"
-  if s:sub(1, 1) == "?" then return "query" end
+  -- Fast path for trivially obvious cases
+  local fast_intent = fast_classify(s)
+  if fast_intent then return fast_intent, nil end
 
-  -- Ends with "?" → almost certainly a question
-  if input:match("%?%s*$") then return "query" end
+  -- AI classification
+  logging.dim and io.write(logging.dim("  [classifying...]\r")) or io.write("  [classifying...]\r")
 
-  -- Strong task signal takes priority over weak query signal
-  for _, pat in ipairs(TASK_VERBS) do
-    if s:match(pat) then return "task" end
+  local classify_prompt = prompts.build_classify_prompt({
+    input           = input,
+    session_context = session_ctx or "",
+  })
+
+  local raw = opencode.run_classify(classify_prompt, model)
+
+  -- Parse response: first non-empty line is the intent, optional second is MODULE:
+  local intent     = nil
+  local mod_target = nil
+  for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
+    line = line:match("^%s*(.-)%s*$")
+    if line ~= "" then
+      if not intent then
+        local upper = line:upper()
+        if upper:find("SELF_IMPROVE") or upper:find("SELF-IMPROVE") then
+          intent = "self_improve"
+        elseif upper:find("QUERY") then
+          intent = "query"
+        elseif upper:find("TASK") then
+          intent = "task"
+        end
+      elseif line:upper():match("^MODULE:%s*(.+)") then
+        mod_target = line:match("^[Mm][Oo][Dd][Uu][Ll][Ee]:%s*(.+)")
+        mod_target = mod_target and mod_target:match("^%s*(.-)%s*$")
+        break
+      end
+    end
   end
 
-  -- Interrogative opening → query
-  for _, pat in ipairs(QUERY_PREFIXES) do
-    if s:match(pat) then return "query" end
+  -- Clear the classifying... line
+  io.write(string.rep(" ", 20) .. "\r")
+
+  -- Fallback: if the model returned something unparseable, default to task
+  if not intent then
+    logging.warn("Classifier returned unrecognised response — defaulting to task.")
+    intent = "task"
   end
 
-  return "task"
+  return intent, mod_target
+end
+
+-- ---------------------------------------------------------------------------
+-- run_self_improve_interactive — handle user-initiated self-improvement.
+-- ---------------------------------------------------------------------------
+local function run_self_improve_interactive(input, model, run_ts, mod_target)
+  if mod_target then
+    logging.step("SELF-IMPROVE", "Targeted: module " .. mod_target)
+    self_improve.run_targeted(model, "user_request", {
+      task_num        = "interactive",
+      task_text       = input,
+      prior_note      = "User explicitly requested improvement of module: " .. mod_target,
+      target_override = { mod_target },
+    })
+  else
+    logging.step("SELF-IMPROVE", "General pass (user-initiated)")
+    self_improve.run_proactive(model, {
+      tasks_done   = 0,
+      tasks_failed = 0,
+      failed_nums  = {},
+      run_ts       = run_ts,
+      user_request = input,
+    })
+  end
+  __refresh_modules()
 end
 
 -- ---------------------------------------------------------------------------
@@ -677,17 +718,19 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
     end
     if input:lower() == "help" then
       print("Commands: status | quit | exit")
-      print("Tasks  : describe what to build/fix/add — Ralph will write files.")
-      print("Queries: ask a question (starts with interrogative, ends with ?, or prefix with ?).")
-      print("         Queries get a direct answer; no files are written.")
+      print("Tasks       : describe what to build/fix/add — Ralph will write files.")
+      print("Queries     : ask a question (starts with interrogative, ends with ?, or prefix with ?).")
+      print("Self-improve: 'improve yourself', 'improve prompts', etc. — rewrites Ralph's own modules.")
       goto continue
     end
 
-    -- Classify: question/query vs. actionable task
-    local intent = classify_input(input)
+    -- Classify: query / self-improve / task
+    local intent, mod_target = classify_input(input, model, session_context())
 
     if intent == "query" then
       run_query(input, model, version, run_ts, session_context())
+    elseif intent == "self_improve" then
+      run_self_improve_interactive(input, model, run_ts, mod_target)
     else
       task_counter = task_counter + 1
       local before = git_utils.snapshot_files()

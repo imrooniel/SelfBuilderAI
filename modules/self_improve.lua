@@ -141,7 +141,14 @@ function M.run_targeted(model, reason, context)
 
   -- Decide which modules are most relevant to the failure
   local targets = {}
-  if reason == "task_failure" then
+  if context.target_override then
+    -- Caller specified exact module(s) — honour it directly
+    targets = context.target_override
+  elseif reason == "user_request" then
+    -- User typed something like "improve yourself" with no specific module.
+    -- Default to the two highest-value modules for general improvement.
+    targets = { "prompts", "self_improve" }
+  elseif reason == "task_failure" then
     targets = { "prompts", "opencode" }
     if (context.iterations or 0) >= 3 then
       targets[#targets+1] = "session"
@@ -218,9 +225,13 @@ function M.run_proactive(model, session_summary)
 
   local mdir = modules_dir()
 
+  local user_note = session_summary.user_request
+    and ("User request: " .. session_summary.user_request .. "\n")
+    or  ""
+
   local prompt = string.format([[
 You are an expert Lua developer improving a programming automation orchestration system.
-This is the end-of-session proactive improvement pass.
+This is %s.
 
 ## IMPORTANT — file locations
 This is an orchestration system, NOT the project being built.
@@ -230,7 +241,7 @@ Do NOT look in src/, scripts/, or PROJECT_PATH for these files.
 Each module block below includes its exact path.
 
 ## Session summary
-Tasks done   : %d
+%sTasks done   : %d
 Tasks failed : %d
 Failed tasks : %s
 Project type : %s
@@ -261,8 +272,10 @@ Rules:
 
 After all rewrites (or NO_IMPROVEMENTS_NEEDED), output: DONE
 ]],
+    session_summary.user_request and "a user-initiated improvement pass" or "the end-of-session proactive improvement pass",
     mdir,
     _G.KERNEL_SOURCE_PATH or "(run_automation.lua)",
+    user_note,
     session_summary.tasks_done   or 0,
     session_summary.tasks_failed or 0,
     table.concat(session_summary.failed_nums or {}, ", "),
