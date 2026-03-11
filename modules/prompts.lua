@@ -4,6 +4,23 @@
 
   Prompts are project-type-aware: they inject the correct technology
   description, source directories, and language-specific context.
+
+  CONTEXT BUDGET PHILOSOPHY
+  ─────────────────────────
+  Every piece of supplementary data injected into a prompt costs tokens that
+  could otherwise be used by the model for reasoning and output. For local
+  models with a 512k context window this matters: a large progress.txt or
+  file listing can silently eat tens of thousands of tokens per prompt.
+
+  Rules enforced here:
+    • progress.txt  — tail only (cfg.CTX_PROGRESS_CHARS chars)
+    • AGENTS.md     — tail only (cfg.CTX_AGENTS_CHARS chars)
+    • File list     — capped at cfg.CTX_FILE_LIST_MAX paths
+    • Section ctx   — capped at cfg.CTX_SECTION_TASKS sibling tasks
+    • Session jnl   — capped at cfg.CTX_JOURNAL_ENTRIES recent entries
+    • Self-improve  — source capped at MAX_SOURCE_CHARS
+    • progress.txt  — injected inline; model does NOT make a tool call to read it
+                      (saves one round-trip and makes the cap reliable)
 ]]
 
 local M = {}
@@ -12,17 +29,41 @@ local cfg          = require("config")
 local project_type = require("project_type")
 
 -- ---------------------------------------------------------------------------
--- Helper: list existing source files
+-- Defaults for context-budget fields (safe values if config is old/missing)
 -- ---------------------------------------------------------------------------
-local function existing_sources_list(max)
-  max = max or 40
+local function ctx(field, default)
+  local v = cfg[field]
+  return (type(v) == "number" and v > 0) and v or default
+end
+
+-- ---------------------------------------------------------------------------
+-- Helper: read a state file, returning at most `max_chars` from the TAIL.
+-- Tail semantics: most recent entries in append-only files are at the bottom.
+-- ---------------------------------------------------------------------------
+local function read_tail(rel_path, max_chars)
+  local f = io.open(cfg.PROJECT_PATH .. "/" .. rel_path, "r")
+  if not f then return "(not found)" end
+  local s = f:read("*a"); f:close()
+  if #s <= max_chars then return s end
+  -- Trim to a line boundary so we don't show half a line
+  local tail = s:sub(#s - max_chars + 1)
+  local newline = tail:find("\n")
+  if newline then tail = tail:sub(newline + 1) end
+  return "[... earlier entries omitted ...]\n" .. tail
+end
+
+-- ---------------------------------------------------------------------------
+-- Helper: list existing source files, capped at max paths
+-- ---------------------------------------------------------------------------
+local function existing_sources_list()
+  local max = ctx("CTX_FILE_LIST_MAX", 20)
   local src_dirs = project_type.get_src_dirs(cfg)
   local paths = {}
   for _, dir in ipairs(src_dirs) do
     local full = cfg.PROJECT_PATH .. "/" .. dir
     local handle = io.popen(string.format(
-      'find "%s" -type f 2>/dev/null | grep -v "__pycache__" | grep -v ".pyc" | head -20',
-      full))
+      'find "%s" -type f 2>/dev/null | grep -v "__pycache__" | grep -v ".pyc" | head -%d',
+      full, max))
     if handle then
       for line in handle:lines() do
         paths[#paths+1] = line:gsub(cfg.PROJECT_PATH .. "/", "")
@@ -33,17 +74,7 @@ local function existing_sources_list(max)
     if #paths >= max then break end
   end
   if #paths == 0 then return "none yet — fresh project" end
-  return table.concat(paths, ", ")
-end
-
--- ---------------------------------------------------------------------------
--- Helper: read a state file
--- ---------------------------------------------------------------------------
-local function read_state_file(rel_path)
-  local f = io.open(cfg.PROJECT_PATH .. "/" .. rel_path, "r")
-  if not f then return "(not found)" end
-  local s = f:read("*a"); f:close()
-  return s
+  return table.concat(paths, "\n")
 end
 
 -- ---------------------------------------------------------------------------
@@ -59,145 +90,137 @@ local function src_dir_listing()
 end
 
 -- ---------------------------------------------------------------------------
+-- Helper: cap a session journal to the most recent N entries
+-- ---------------------------------------------------------------------------
+local function cap_journal(session_context)
+  if session_context == "" then return "" end
+  local max = ctx("CTX_JOURNAL_ENTRIES", 10)
+  local entries = {}
+  for line in (session_context .. "\n"):gmatch("([^\n]+)\n?") do
+    if line ~= "" then entries[#entries+1] = line end
+  end
+  if #entries <= max then return session_context end
+  local trimmed = {}
+  for i = #entries - max + 1, #entries do trimmed[#trimmed+1] = entries[i] end
+  return "[... " .. (#entries - max) .. " earlier entries omitted ...]\n"
+    .. table.concat(trimmed, "\n")
+end
+
+-- ---------------------------------------------------------------------------
+-- Helper: cap section_context to the most recent N tasks
+-- ---------------------------------------------------------------------------
+local function cap_section_context(section_context)
+  if section_context == "" then return "" end
+  local max = ctx("CTX_SECTION_TASKS", 10)
+  local lines = {}
+  for line in (section_context .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines+1] = line
+  end
+  if #lines <= max then return section_context end
+  local trimmed = {}
+  for i = #lines - max + 1, #lines do trimmed[#trimmed+1] = lines[i] end
+  return "[... " .. (#lines - max) .. " earlier tasks omitted ...]\n"
+    .. table.concat(trimmed, "\n")
+end
+
+-- ---------------------------------------------------------------------------
 -- build_task_prompt
 -- ---------------------------------------------------------------------------
 function M.build_task_prompt(opts)
   local task_num        = opts.task_num
   local task_text       = opts.task_text
-  local section_context = opts.section_context or ""
+  local section_context = cap_section_context(opts.section_context or "")
   local iteration       = opts.iteration or 1
   local prior_note      = opts.prior_note or "No details recorded."
   local version         = opts.version or "unknown"
   local tool_context    = opts.tool_context or ""
-  local session_context = opts.session_context or ""
+  local session_context = cap_journal(opts.session_context or "")
 
   local tech     = project_type.get_tech(cfg)
   local src_dirs = project_type.get_src_dirs(cfg)
   local primary_dir = src_dirs[1] and (cfg.PROJECT_PATH .. "/" .. src_dirs[1]) or cfg.PROJECT_PATH
+
+  -- Read state files inline (capped) — avoids a tool call round-trip per prompt
+  -- and makes the budget cap reliable vs. an unbounded tool-call read.
+  local progress_text = read_tail(cfg.PROGRESS_FILE, ctx("CTX_PROGRESS_CHARS", 2000))
+  local agents_text   = read_tail(cfg.AGENTS_FILE,   ctx("CTX_AGENTS_CHARS",   3000))
 
   local retry_block = ""
   if iteration > 1 then
     retry_block = string.format([[
 
 ## !! RETRY — iteration %d/%d !!
-Previous attempt(s) made NO file changes. This is unacceptable.
-What was noted: %s
-DO NOT explore or list directories again. Skip straight to writing the file.
-Target directory: %s
-Create the file NOW using write_file or a shell command.
-]], iteration, cfg.MAX_ITERATIONS, prior_note, primary_dir)
+Previous attempt(s) made NO file changes. What was noted: %s
+Skip straight to writing the file. Target directory: %s
+
+]],    iteration, cfg.MAX_ITERATIONS, prior_note, primary_dir)
   end
 
-  -- Inject project-type-specific extra context
+  -- Project-type rules as a single compact line to minimise tokens
   local type_hints = ""
   local pt = cfg.PROJECT_TYPE
   if pt == "unity" then
-    type_hints = string.format([[
-## Unity-specific rules
-- Namespace: use your project namespace (see AGENTS.md)
-- MonoBehaviours → Assets/Scripts/Core/
-- Editor scripts → Assets/Scripts/Editor/ (only compiled in Editor)
-- Never use deprecated Unity APIs
-- Version: %s
-]], version)
+    type_hints = "Unity: use project namespace; MonoBehaviours→Assets/Scripts/Core/; Editor scripts→Assets/Scripts/Editor/; no deprecated APIs. v" .. version
   elseif pt == "rust" then
-    type_hints = [[
-## Rust-specific rules
-- Use idiomatic Rust (clippy-clean)
-- Prefer Result<T,E> over unwrap() in library code
-- Keep unsafe blocks minimal and documented
-- Add doc comments (///) to public items
-]]
+    type_hints = "Rust: clippy-clean; Result<T,E> over unwrap() in libs; minimal unsafe; doc comments on public items."
   elseif pt == "node" then
-    type_hints = [[
-## TypeScript/Node-specific rules
-- Prefer strict TypeScript — avoid `any`
-- Use ES2022+ syntax
-- Export types explicitly
-- Keep functions pure where possible
-]]
+    type_hints = "TS: strict mode, no `any`; ES2022+; explicit type exports; pure functions preferred."
   elseif pt == "python" then
-    type_hints = [[
-## Python-specific rules
-- Follow PEP 8 and PEP 257 (docstrings)
-- Use type hints throughout
-- Prefer dataclasses/Pydantic for data models
-- Avoid mutable default arguments
-]]
+    type_hints = "Python: PEP 8/257; type hints throughout; dataclasses/Pydantic for models; no mutable defaults."
   elseif pt == "go" then
-    type_hints = [[
-## Go-specific rules
-- Follow effective Go conventions
-- Return errors explicitly (don't panic)
-- Add comments to all exported symbols
-- Keep goroutines and channels documented
-]]
+    type_hints = "Go: effective-Go; return errors (no panic); export comments; document goroutines."
   end
 
-  -- Build session history block (empty string = omit section entirely)
-  local session_block = ""
-  if session_context ~= "" then
-    session_block = "## What has been built in this session (read before writing anything)\n"
-      .. session_context .. "\n"
-  end
+  local session_block = session_context ~= ""
+    and ("## This session — completed tasks\n" .. session_context .. "\n\n")
+    or  ""
+
+  local section_block = section_context ~= ""
+    and ("## Sibling tasks in this batch\n" .. section_context .. "\n\n")
+    or  ""
+
+  local tool_block = tool_context ~= ""
+    and (tool_context .. "\n\n")
+    or  ""
 
   return string.format([[
-You are a %s developer. Your job is to write code, not explore.
+You are a %s developer. Write code immediately — do not explore first.
 
-## CRITICAL RULES — read before anything else
-1. DO NOT spend more than one tool call on exploration.
-2. Write the required file(s) IMMEDIATELY.
-3. ALWAYS read a file with the Read tool before editing or overwriting it.
-4. When done, output a line containing ONLY the word: DONE
-
-## Persistent memory — read these two files first (one tool call each):
-- %s/%s
-- %s/%s
+## Rules
+1. At most ONE tool call for exploration before writing.
+2. Read a file before editing it.
+3. When finished, output exactly: DONE
 
 ## Project
-Path: %s
-Technology: %s
-Version: %s
-
-## Existing source files (for reference only — do not re-read all of them)
+Path: %s | Tech: %s | Version: %s
+Dirs: %s
+%s
+## AGENTS.md
 %s
 
-## Directory layout
+## Recent progress
 %s
-%s
-%s
-%s
-%s
-## Section context (other tasks in this batch for coherence)
+%s%s%s## Existing files
 %s
 
-## Task #%s — implement this now
+## Task #%s
 %s
 
-## Your action sequence (follow exactly, in order)
-1. Read %s/%s
-2. Read %s/%s
-3. Write the required file(s)
-4. Append a one-line discovery note to %s/%s
-5. Output exactly: DONE
+## On completion
+Append one discovery note to %s/%s, then output: DONE
 ]],
     tech,
-    cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
-    cfg.PROJECT_PATH, cfg.AGENTS_FILE,
-    cfg.PROJECT_PATH,
-    tech,
-    version,
-    existing_sources_list(),
+    cfg.PROJECT_PATH, tech, version,
     src_dir_listing(),
+    type_hints ~= "" and ("Lang rules: " .. type_hints .. "\n") or "",
+    agents_text,
+    progress_text,
     retry_block,
-    type_hints,
-    tool_context,
     session_block,
-    section_context,
-    task_num,
-    task_text,
-    cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
-    cfg.PROJECT_PATH, cfg.AGENTS_FILE,
+    section_block,
+    tool_block,
+    existing_sources_list(),
+    task_num, task_text,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE)
 end
 
@@ -205,63 +228,49 @@ end
 -- build_fix_prompt
 -- ---------------------------------------------------------------------------
 function M.build_fix_prompt(opts)
-  local task_num       = opts.task_num
-  local task_text      = opts.task_text
-  local compile_errors = opts.compile_errors or ""
-  local version        = opts.version or "unknown"
-  local session_context = opts.session_context or ""
+  local task_num        = opts.task_num
+  local task_text       = opts.task_text
+  local compile_errors  = opts.compile_errors or ""
+  local version         = opts.version or "unknown"
+  local session_context = cap_journal(opts.session_context or "")
 
   local tech = project_type.get_tech(cfg)
 
-  local session_block = ""
-  if session_context ~= "" then
-    session_block = "## What has been built in this session\n" .. session_context .. "\n"
-  end
+  local session_block = session_context ~= ""
+    and ("## This session\n" .. session_context .. "\n\n")
+    or  ""
 
   return string.format([[
-You are a %s developer. Fix compile/check errors — do not explore.
+You are a %s developer. Fix compile errors — do not restructure working code.
 
-## CRITICAL RULES
-1. Read each file BEFORE editing — editing without reading first will fail.
-2. Open the file(s) listed in the errors below IMMEDIATELY.
-3. Fix ONLY the reported errors. Do not restructure working code.
-4. Output a line containing ONLY: DONE
+## Rules
+1. Read each erroring file BEFORE editing.
+2. Fix ONLY the reported errors.
+3. Output exactly: DONE
 
-## Read these first (one call each):
-- %s/%s
-- %s/%s
-%s
-## Task that was implemented
-#%s: %s
+## Project: %s | Version: %s
+%s## Task implemented: #%s — %s
 
-## Errors to fix NOW
+## Errors
 %s
 
-## Existing source files
+## Existing files
 %s
 
-## Action sequence
-1. Read %s/%s
-2. Read %s/%s
-3. Read the file(s) listed in the errors (Read tool)
-4. Edit the file(s) to fix the errors (Edit tool)
-5. Output exactly: DONE
+Fix the errors, then output: DONE
 ]],
     tech,
-    cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
-    cfg.PROJECT_PATH, cfg.AGENTS_FILE,
+    cfg.PROJECT_PATH, version,
     session_block,
     task_num, task_text,
     compile_errors,
-    existing_sources_list(),
-    cfg.PROJECT_PATH, cfg.PROGRESS_FILE,
-    cfg.PROJECT_PATH, cfg.AGENTS_FILE)
+    existing_sources_list())
 end
 
 -- ---------------------------------------------------------------------------
 -- build_self_improve_prompt
 -- ---------------------------------------------------------------------------
-local MAX_SOURCE_CHARS = 24000   -- ~6k tokens; keeps us well inside context limits
+local MAX_SOURCE_CHARS = 24000   -- ~6k tokens
 
 function M.build_self_improve_prompt(opts)
   local mod_name       = opts.mod_name
@@ -270,92 +279,76 @@ function M.build_self_improve_prompt(opts)
   local context_str    = opts.context_str or ""
   local progress       = opts.progress or ""
 
-  -- Guard: truncate oversized sources with a visible marker so the model knows
   if #current_source > MAX_SOURCE_CHARS then
     current_source = current_source:sub(1, MAX_SOURCE_CHARS)
-      .. "\n\n-- [SOURCE TRUNCATED FOR CONTEXT — " .. #(opts.current_source) .. " chars total]\n"
+      .. "\n\n-- [SOURCE TRUNCATED — " .. #(opts.current_source) .. " chars total]\n"
+  end
+  local prog_cap = ctx("CTX_PROGRESS_CHARS", 2000)
+  if #progress > prog_cap then
+    progress = "[... omitted ...]\n" .. progress:sub(#progress - prog_cap + 1)
   end
 
   return string.format([[
-You are an expert Lua developer improving a programming automation orchestration system.
+You are an expert Lua developer improving a programming automation system.
 
-## Improvement trigger
 Reason: %s
 Context: %s
 
-## Cross-task learnings (progress.txt)
+## Recent progress
 %s
 
-## Current source of module: %s
+## Module: %s
 ```lua
 %s
 ```
 
-## Your task
-Rewrite this module to fix the problem described above.
-Rules:
-  1. Return ONLY valid Lua 5.4 source code — no markdown, no explanation, no backticks.
-  2. The module must return a table named M.
-  3. Do not remove existing functionality — only improve or fix.
-  4. Keep all existing function signatures compatible.
-  5. If nothing needs changing, return the source UNCHANGED.
+Rewrite to fix the problem above. Rules:
+  1. Return ONLY valid Lua 5.4 — no markdown, no backticks.
+  2. Module must return table M.
+  3. Do not remove functionality.
+  4. Keep all function signatures compatible.
+  5. If nothing needs changing, return source UNCHANGED.
 
-Output the complete new Lua source now, starting with the module header comment.
+Output the complete Lua source now.
 ]],
     reason, context_str, progress, mod_name, current_source)
 end
 
 -- ---------------------------------------------------------------------------
--- build_query_prompt — lightweight one-shot Q&A (no file writing expected)
+-- build_query_prompt — lightweight one-shot Q&A
 -- ---------------------------------------------------------------------------
 function M.build_query_prompt(opts)
   local question        = opts.question or ""
   local version         = opts.version  or "unknown"
-  local session_context = opts.session_context or ""
-  local tech     = project_type.get_tech(cfg)
-  local src_dirs = project_type.get_src_dirs(cfg)
+  local session_context = cap_journal(opts.session_context or "")
+  local tech            = project_type.get_tech(cfg)
 
-  local dir_lines = {}
-  for _, d in ipairs(src_dirs) do
-    dir_lines[#dir_lines+1] = "- " .. cfg.PROJECT_PATH .. "/" .. d
-  end
-
-  local session_block = ""
-  if session_context ~= "" then
-    session_block = "## What has been built in this session\n" .. session_context .. "\n"
-  end
+  local session_block = session_context ~= ""
+    and ("## This session\n" .. session_context .. "\n\n")
+    or  ""
 
   return string.format([[
-You are a %s developer assistant. Answer the question below concisely.
+You are a %s developer assistant. Answer concisely.
 
-## Project
-Path: %s
-Technology: %s
-Version: %s
+Project: %s | Tech: %s | Version: %s
+Dirs: %s
+Files: %s
 
-## Source layout
-%s
+%s%s
 
-## Existing files (for context)
-%s
-%s
-## Question
-%s
-
-## Rules
-- Answer directly. Do NOT write or modify any files unless explicitly asked.
-- Do NOT output DONE.
-- Keep your answer concise and focused.
+Do not write or modify files. Do not output DONE.
 ]],
     tech,
-    cfg.PROJECT_PATH,
-    tech,
-    version,
-    table.concat(dir_lines, "\n"),
+    cfg.PROJECT_PATH, tech, version,
+    src_dir_listing(),
     existing_sources_list(),
     session_block,
     question)
 end
+
+-- ---------------------------------------------------------------------------
+-- Nudge prompts — varied so a stalled model gets a different angle each time
+-- ---------------------------------------------------------------------------
 local _NUDGE_PROMPTS = {
   "You appear to have stopped mid-task. Continue from where you left off "
     .. "and write the remaining file(s). Output DONE on its own line when complete.",

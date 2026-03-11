@@ -96,4 +96,17 @@ M.SELF_IMPROVE_ENABLED  = true    -- set false to disable all AI self-improvemen
 M.SELF_IMPROVE_TARGETED = true    -- targeted pass on task failure / compile error
 M.SELF_IMPROVE_PROACTIVE = true   -- proactive pass at end of each session
 
+-- ---------------------------------------------------------------------------
+-- Context budget — tune for your model's context window.
+-- These control how much supplementary data is injected into every prompt.
+-- At 512k context a local model uses roughly 3–4 chars per token, so
+-- 512k tokens ≈ 1.5–2 MB of text. The defaults below leave ~80% of the
+-- window for the model's own output and tool call round-trips.
+-- ---------------------------------------------------------------------------
+M.CTX_PROGRESS_CHARS   = 2000   -- max chars of progress.txt tail injected per prompt
+M.CTX_AGENTS_CHARS     = 3000   -- max chars of AGENTS.md injected per prompt
+M.CTX_FILE_LIST_MAX    = 20     -- max source file paths listed in prompt
+M.CTX_SECTION_TASKS    = 10     -- max sibling tasks shown in section_context
+M.CTX_JOURNAL_ENTRIES  = 10     -- max recent journal entries passed as session context
+
 return M
