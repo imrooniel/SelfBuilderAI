@@ -62,47 +62,129 @@ local function read_progress()
 end
 
 -- ---------------------------------------------------------------------------
--- Helper: run an improvement call and extract Lua source from log
+-- Helper: validate Lua syntax via luac (preferred) or loadstring fallback.
+-- Returns nil on success, error string on failure.
 -- ---------------------------------------------------------------------------
-local function run_improve_call(model, prompt, log_path)
-  local f = io.open(log_path, "w"); if f then f:close() end
-  opencode.run_fresh(log_path, prompt, model)
-
-  local log_content = read_file(log_path)
-
-  -- Extract the Lua source block. The model is instructed to return raw Lua
-  -- with no markdown fences, starting with a comment header and ending with
-  -- "return M". We scan line-by-line to find the first line that looks like
-  -- a Lua module header and capture everything through the last "return M".
-  --
-  -- Strategy: collect all lines between the first ^--[[ or ^-- header and the
-  -- last occurrence of a line matching ^return M, inclusive.
-  local lines = {}
-  for line in (log_content .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines+1] = line
+local function check_lua_syntax(source, label)
+  -- Strategy 1: luac -p (catches more than loadstring — detects upvalue issues etc.)
+  local tmp = os.tmpname() .. ".lua"
+  local f = io.open(tmp, "w")
+  if f then
+    f:write(source); f:close()
+    local handle = io.popen(string.format('luac -p "%s" 2>&1', tmp))
+    local out = handle and handle:read("*a") or ""
+    if handle then handle:close() end
+    os.remove(tmp)
+    if out:match("%S") then
+      -- luac found errors
+      return "luac: " .. out:gsub("%s+$", "")
+    end
+    return nil   -- clean
   end
 
-  local start_idx = nil
-  local end_idx   = nil
+  -- Strategy 2: loadstring fallback (luac unavailable)
+  local chunk, err = load(source, label or "rewrite")
+  if not chunk then
+    return "syntax: " .. tostring(err)
+  end
+  return nil
+end
 
-  for i, line in ipairs(lines) do
-    if start_idx == nil and (line:match("^%-%-%[%[") or line:match("^%-%- ")) then
-      start_idx = i
-    end
-    if line:match("^return%s+M") then
-      end_idx = i   -- keep updating so we get the LAST occurrence
+-- ---------------------------------------------------------------------------
+-- Helper: extract Lua source from a completed opencode log.
+--
+-- Extraction order (most → least reliable):
+--   1. Fenced block:  ```lua … ``` (proactive prompt uses this format)
+--   2. Marker block:  REWRITE_MODULE: name … END_REWRITE  (same format)
+--   3. Bare source:   first --[[ or "-- " header through last "return M"
+--      This is the targeted-pass format (model returns raw Lua).
+--
+-- After extraction the source is validated:
+--   • Must contain "return M" (basic module shape)
+--   • Must pass luac -p / loadstring syntax check
+-- ---------------------------------------------------------------------------
+local function extract_lua_source(log_content, mod_name)
+  local source = nil
+
+  -- 1. Fenced ```lua block (look for the LAST occurrence so we skip preamble)
+  local last_fence = nil
+  for block in log_content:gmatch("```lua\n(.-)\n```") do
+    last_fence = block
+  end
+  if last_fence and last_fence:find("return%s+M") then
+    source = last_fence
+  end
+
+  -- 2. REWRITE_MODULE marker block (mod_name optional — take the last one)
+  if not source then
+    local pattern = mod_name
+      and ("REWRITE_MODULE:%s*" .. mod_name .. "%s*\n```lua\n(.-)\n```\nEND_REWRITE")
+      or  "REWRITE_MODULE:%s*[%w_]+%s*\n```lua\n(.-)\n```\nEND_REWRITE"
+    local last_marker = nil
+    for block in log_content:gmatch(pattern) do last_marker = block end
+    if last_marker and last_marker:find("return%s+M") then
+      source = last_marker
     end
   end
 
-  if not start_idx or not end_idx or end_idx < start_idx then
+  -- 3. Bare-source fallback: header comment → last "return M"
+  if not source then
+    local lines = {}
+    for line in (log_content .. "\n"):gmatch("([^\n]*)\n") do
+      lines[#lines+1] = line
+    end
+    local start_idx, end_idx = nil, nil
+    for i, line in ipairs(lines) do
+      if not start_idx and (line:match("^%-%-%[%[") or line:match("^%-%-%s+modules/")) then
+        start_idx = i
+      end
+      if line:match("^return%s+M%s*$") then
+        end_idx = i   -- keep updating → last occurrence
+      end
+    end
+    if start_idx and end_idx and end_idx > start_idx then
+      local extracted = {}
+      for i = start_idx, end_idx do extracted[#extracted+1] = lines[i] end
+      local candidate = table.concat(extracted, "\n")
+      -- Sanity: candidate must be at least 100 chars (not a stub)
+      if #candidate >= 100 then source = candidate end
+    end
+  end
+
+  if not source then
+    logging.warn(string.format("[self_improve] %s: could not extract Lua source from log.", mod_name or "?"))
     return nil
   end
 
-  local extracted = {}
-  for i = start_idx, end_idx do
-    extracted[#extracted+1] = lines[i]
+  -- Structural checks (cheap, before the luac call)
+  if not source:find("return%s+M") then
+    logging.warn(string.format("[self_improve] %s: extracted source missing 'return M'.", mod_name or "?"))
+    return nil
   end
-  return table.concat(extracted, "\n")
+  if #source < 100 then
+    logging.warn(string.format("[self_improve] %s: extracted source suspiciously short (%d chars).", mod_name or "?", #source))
+    return nil
+  end
+
+  -- Syntax check
+  local syn_err = check_lua_syntax(source, mod_name)
+  if syn_err then
+    logging.warn(string.format("[self_improve] %s: syntax check FAILED — %s", mod_name or "?", syn_err))
+    return nil
+  end
+
+  logging.log(string.format("[self_improve] %s: extracted %d bytes, syntax OK.", mod_name or "?", #source))
+  return source
+end
+
+-- ---------------------------------------------------------------------------
+-- Helper: run an improvement call and extract Lua source from log
+-- ---------------------------------------------------------------------------
+local function run_improve_call(model, prompt, log_path, mod_name)
+  local f = io.open(log_path, "w"); if f then f:close() end
+  opencode.run_fresh(log_path, prompt, model)
+  local log_content = read_file(log_path)
+  return extract_lua_source(log_content, mod_name)
 end
 
 -- ---------------------------------------------------------------------------
@@ -111,6 +193,14 @@ end
 local function apply_rewrite(mod_name, new_source, reason)
   if not new_source or new_source:match("^%s*$") then
     logging.warn(string.format("[self_improve] %s: AI returned empty source — skipping.", mod_name))
+    return false
+  end
+
+  -- Syntax must be clean before we touch disk (extract_lua_source already
+  -- checks, but run_proactive feeds source directly here so check again).
+  local syn_err = check_lua_syntax(new_source, mod_name)
+  if syn_err then
+    logging.warn(string.format("[self_improve] %s: apply_rewrite syntax gate FAILED — %s", mod_name, syn_err))
     return false
   end
 
@@ -195,7 +285,7 @@ function M.run_targeted(model, reason, context)
     local log_path = string.format("%s/logs/self-improve-%s-%s-%s.log",
       cfg.PROJECT_PATH, mod_name, reason, run_ts)
 
-    local new_source = run_improve_call(model, prompt_text, log_path)
+    local new_source = run_improve_call(model, prompt_text, log_path, mod_name)
     apply_rewrite(mod_name, new_source, reason)
   end
 end
@@ -268,7 +358,16 @@ Rules:
   2. Each module source must be complete, valid Lua 5.4, returning table M.
   3. Do not remove functionality — only improve.
   4. Keep all existing function signatures compatible.
-  5. If no improvements are warranted, output: NO_IMPROVEMENTS_NEEDED
+  5. Only call functions that actually exist on required modules.
+     NEVER invent function names (e.g. opencode.run_targeted does not exist —
+     only run_fresh, run_continue, run_classify, log_says_done exist).
+  6. Each rewritten module MUST include a M.validate() function that asserts
+     the external module functions it calls actually exist. Example:
+       function M.validate()
+         local oc = require("opencode")
+         assert(type(oc.run_fresh) == "function", "opencode.run_fresh missing")
+       end
+  7. If no improvements are warranted, output: NO_IMPROVEMENTS_NEEDED
 
 After all rewrites (or NO_IMPROVEMENTS_NEEDED), output: DONE
 ]],
@@ -389,6 +488,23 @@ After all suggestions, output: DONE
   else
     logging.log("[self_improve] No kernel suggestions generated.")
   end
+end
+
+-- ---------------------------------------------------------------------------
+-- validate — called by hot_reload after a rewrite to verify dependencies.
+-- Returns nothing on success; errors with assert() on failure.
+-- This catches AI rewrites that call non-existent functions on other modules.
+-- ---------------------------------------------------------------------------
+function M.validate()
+  local oc = require("opencode")
+  assert(type(oc.run_fresh)    == "function", "opencode.run_fresh missing")
+  assert(type(oc.run_classify) == "function", "opencode.run_classify missing")
+  local pr = require("prompts")
+  assert(type(pr.build_self_improve_prompt) == "function", "prompts.build_self_improve_prompt missing")
+  local hr = require("hot_reload")
+  assert(type(hr.write_and_reload) == "function", "hot_reload.write_and_reload missing")
+  assert(type(hr.source)           == "function", "hot_reload.source missing")
+  assert(type(hr.list)             == "function", "hot_reload.list missing")
 end
 
 return M
