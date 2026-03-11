@@ -363,7 +363,10 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
         while not opencode.log_says_done(fix_log) and fix_nudge < 4 do
           fix_nudge = fix_nudge + 1
           logging.log(string.format("Fix continue nudge %d/4...", fix_nudge))
-          opencode.run_continue(fix_log, fix_session, prompts.FIX_NUDGE_PROMPT, model)
+          local fix_nudge_text = type(prompts.get_fix_nudge) == "function"
+            and prompts.get_fix_nudge(fix_nudge)
+            or  prompts.FIX_NUDGE_PROMPT   -- fallback for old prompts.lua
+          opencode.run_continue(fix_log, fix_session, fix_nudge_text, model)
         end
 
         logging.log(string.format("Re-running compile check after fix round %d...", fix_round))
@@ -731,6 +734,10 @@ local function run_query(question, model, version, run_ts, session_context)
 
   opencode.run_fresh(log_file, prompt, model)
   print()
+  -- Print a clear visual delimiter so the user knows the answer is complete
+  -- and the REPL is ready for further input. Without this, the prompt reappears
+  -- silently and it looks like the system stalled.
+  logging.step("READY", "Query answered. Ask another question or describe a task.")
 end
 
 -- ---------------------------------------------------------------------------

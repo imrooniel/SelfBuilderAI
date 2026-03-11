@@ -71,12 +71,16 @@ local function run_improve_call(model, prompt, log_path)
   local log_content = read_file(log_path)
 
   -- Extract the Lua source block. The model is instructed to return raw Lua
-  -- with no markdown fences, starting with a comment header and ending with
-  -- "return M". We scan line-by-line to find the first line that looks like
-  -- a Lua module header and capture everything through the last "return M".
+  -- with no markdown fences, starting with a module header comment and ending
+  -- with "return M". We look for:
+  --   1. First line matching the canonical module header  ^--%[%[  (block comment open)
+  --   2. Failing that, first ^local M = {}  line (handles bare rewrites)
+  --   3. Last line matching ^return%s+M
   --
-  -- Strategy: collect all lines between the first ^--[[ or ^-- header and the
-  -- last occurrence of a line matching ^return M, inclusive.
+  -- We deliberately skip lines that begin with "-- " (single-line dash comments)
+  -- as the model often emits preamble prose as Lua-style comments before the
+  -- actual module source (e.g. "-- Here is the improved module:"). Anchoring on
+  -- ^--%[%[ (block comment open) avoids latching onto those lines.
   local lines = {}
   for line in (log_content .. "\n"):gmatch("([^\n]*)\n") do
     lines[#lines+1] = line
@@ -85,12 +89,23 @@ local function run_improve_call(model, prompt, log_path)
   local start_idx = nil
   local end_idx   = nil
 
+  -- Pass 1: prefer the canonical block-comment module header
   for i, line in ipairs(lines) do
-    if start_idx == nil and (line:match("^%-%-%[%[") or line:match("^%-%- ")) then
+    if start_idx == nil and line:match("^%-%-%[%[") then
       start_idx = i
     end
     if line:match("^return%s+M") then
-      end_idx = i   -- keep updating so we get the LAST occurrence
+      end_idx = i
+    end
+  end
+
+  -- Pass 2: fallback — accept the first "local M = {}" if no block header found
+  if not start_idx then
+    for i, line in ipairs(lines) do
+      if line:match("^local%s+M%s*=%s*{}") then
+        start_idx = i
+        break
+      end
     end
   end
 
@@ -118,9 +133,13 @@ local function apply_rewrite(mod_name, new_source, reason)
   local ok, err = hot_reload.write_and_reload(mod_name, new_source)
   if ok then
     logging.ok(string.format("[self_improve] %s successfully rewritten and hot-reloaded.", mod_name))
+    -- Commit in the directory that actually contains the module files (the kernel
+    -- directory), not cfg.PROJECT_PATH which may be a different repo entirely.
+    local mdir = modules_dir()
+    local commit_dir = mdir:match("^(.*)/[^/]+$") or mdir  -- parent of modules/
     os.execute(string.format(
       'cd "%s" && git add -A && git commit -m "self-improve: rewrite %s [%s]" 2>/dev/null',
-      cfg.PROJECT_PATH, mod_name, reason))
+      commit_dir, mod_name, reason))
     return true
   else
     logging.warn(string.format("[self_improve] %s rewrite FAILED (rolled back): %s", mod_name, err))
@@ -250,12 +269,27 @@ function M.run_proactive(model, session_summary)
 
   local sources_block = {}
   local remaining_names = {}
+  -- Total source budget: leave room for the prompt skeleton, progress, and session data.
+  -- cfg.CTX_PROMPT_HARD_CAP governs task prompts; self-improve prompts are larger, so
+  -- we use a dedicated budget: ~18k chars for source blocks ≈ 4.5k tokens.
+  local SOURCE_BUDGET   = 18000
+  local used_source     = 0
   for i, name in ipairs(module_names) do
     local src  = hot_reload.source(name) or ""
     local path = module_path(name)
-    if i <= MAX_FULL_SOURCES then
+    if i <= MAX_FULL_SOURCES and used_source < SOURCE_BUDGET then
+      local avail    = SOURCE_BUDGET - used_source
+      local src_clip = src:sub(1, avail)
+      -- Trim to a line boundary
+      if #src_clip < #src then
+        local lb = src_clip:match("^(.*)\n[^\n]*$")
+        if lb then src_clip = lb end
+      end
       sources_block[#sources_block+1] = string.format(
-        "=== %s ===\nPath: %s\n%s\n", name, path, src:sub(1, 4000))
+        "=== %s ===\nPath: %s\n%s%s\n",
+        name, path, src_clip,
+        (#src_clip < #src) and ("\n-- [...truncated, " .. #src .. " chars total]") or "")
+      used_source = used_source + #src_clip
     else
       remaining_names[#remaining_names+1] = name
     end
@@ -481,6 +515,9 @@ function M.validate()
   assert(type(hr.write_and_reload) == "function", "hot_reload.write_and_reload missing")
   assert(type(hr.source)           == "function", "hot_reload.source missing")
   assert(type(hr.list)             == "function", "hot_reload.list missing")
+  -- run_proactive calls hr.list() — verify it returns a table
+  local names = hr.list()
+  assert(type(names) == "table", "hot_reload.list() did not return a table")
 end
 
 return M

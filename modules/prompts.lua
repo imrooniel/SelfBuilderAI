@@ -219,7 +219,7 @@ Dirs: %s
 
 ## Recent progress
 %s
-%s%s%s%s## Task #%s
+%s%s%s%s%s## Task #%s
 %s
 
 ## On completion
@@ -235,8 +235,7 @@ Append one discovery note to %s/%s, then output: DONE
     session_block,
     section_block,
     tool_block,
-    file_block,
-    existing_sources_list(),
+    file_block,   -- already contains the file list (or omission notice) from the budget gate above
     task_num, task_text,
     cfg.PROJECT_PATH, cfg.AGENTS_FILE)
 end
@@ -256,6 +255,21 @@ function M.build_fix_prompt(opts)
   local session_block = session_context ~= ""
     and ("## This session\n" .. session_context .. "\n\n")
     or  ""
+
+  -- Apply budget gate — compile errors already reference specific file paths so
+  -- the full listing is less critical here; drop it if space is tight.
+  local hard_cap   = ctx("CTX_PROMPT_HARD_CAP", 12000)
+  local used_chars = #session_block + #compile_errors
+  local file_list  = existing_sources_list()
+  local file_block
+  if used_chars + #file_list <= hard_cap then
+    file_block = file_list
+  else
+    file_block = "(omitted — context budget; errors above reference the relevant paths)"
+    logging.log(string.format(
+      "[prompts] fix file list omitted: budget %d, used %d, list %d chars",
+      hard_cap, used_chars, #file_list))
+  end
 
   return string.format([[
 You are a %s developer. Fix compile errors — do not restructure working code.
@@ -281,7 +295,7 @@ Fix the errors, then output: DONE
     session_block,
     task_num, task_text,
     compile_errors,
-    existing_sources_list())
+    file_block)
 end
 
 -- ---------------------------------------------------------------------------
@@ -298,8 +312,20 @@ function M.build_self_improve_prompt(opts)
   local progress       = opts.progress or ""
 
   if #current_source > MAX_SOURCE_CHARS then
-    current_source = current_source:sub(1, MAX_SOURCE_CHARS)
-      .. "\n\n-- [SOURCE TRUNCATED — " .. #(opts.current_source) .. " chars total]\n"
+    -- Keep the head (public API / require block) and the tail (return M + last
+    -- few functions) so the model always sees the module contract and the end.
+    -- Losing the middle (internal helpers) is far less harmful than losing either end.
+    local head_chars = math.floor(MAX_SOURCE_CHARS * 0.6)
+    local tail_chars = MAX_SOURCE_CHARS - head_chars
+    local head = current_source:sub(1, head_chars)
+    local tail = current_source:sub(#current_source - tail_chars + 1)
+    -- Trim to line boundaries
+    head = head:match("^(.-)\n[^\n]*$") or head   -- drop the partial last line
+    local tail_start = tail:find("\n")
+    if tail_start then tail = tail:sub(tail_start + 1) end
+    current_source = head
+      .. string.format("\n\n-- [... %d chars omitted ...]\n\n", #(opts.current_source) - head_chars - tail_chars)
+      .. tail
   end
   local prog_cap = ctx("CTX_PROGRESS_CHARS", 2000)
   if #progress > prog_cap then
@@ -410,24 +436,36 @@ function M.build_classify_prompt(opts)
 
   return string.format([[
 You are classifying user input for a programming automation tool called Ralph.
-Ralph has two distinct contexts:
+Ralph has TWO completely separate contexts. Read this carefully before classifying.
 
-1. THE PROJECT: %s code being built at %s
-2. THE ORCHESTRATOR: Ralph's own Lua modules at %s
-   Known modules: %s
+CONTEXT A — THE PROJECT
+  %s code being built at: %s
+  This is the user's own software project.
 
-%sClassify the following input into exactly one category:
+CONTEXT B — THE ORCHESTRATOR (Ralph itself)
+  Ralph's own Lua automation modules at: %s
+  Known modules: %s
+  This is the tool the user is currently talking TO.
 
-  TASK         — user wants to build, write, fix, or modify something in THE PROJECT
-  SELF_IMPROVE — user wants to improve THE ORCHESTRATOR (Ralph itself, its modules, its behaviour, its prompts, etc.)
-  QUERY        — user wants an answer to a question; no files should be written
+CLASSIFICATION RULES:
+  TASK         — User wants to build, write, fix, or modify something in CONTEXT A (the project).
+  SELF_IMPROVE — User wants to improve, audit, review, or change CONTEXT B (Ralph/the orchestrator/these modules).
+  QUERY        — User wants an answer to a question; no files should be written.
+
+KEY DISAMBIGUATION:
+  - "your lua code", "your modules", "your prompts", "how do you work", "audit yourself",
+    "improve yourself", "review your code" → SELF_IMPROVE (refers to Ralph, CONTEXT B)
+  - "audit the project", "write a module for the project" → TASK (refers to CONTEXT A)
+  - Phrases like "your", "yourself", "this system", "Ralph" always mean CONTEXT B → SELF_IMPROVE or QUERY
+  - If the project is empty/new and the request mentions code that doesn't exist yet → probably SELF_IMPROVE
+  - A question about how Ralph works or what it does → QUERY
 
 If SELF_IMPROVE and a specific module name is mentioned or clearly implied, add a second line:
   MODULE: <module_name>
 
 Respond with ONLY the category (and optional MODULE line). No explanation.
 
-Input: %s
+%sInput: %s
 ]],
     tech, cfg.PROJECT_PATH,
     cfg.KERNEL_MODULES_DIR or _G.KERNEL_MODULES_DIR or "modules/",
@@ -435,6 +473,11 @@ Input: %s
     session_block,
     input)
 end
+
+-- ---------------------------------------------------------------------------
+-- Nudge prompts — rotated by get_nudge(count) so repeated nudges don't feel
+-- identical. FIX nudges are round-aware to escalate urgency.
+-- ---------------------------------------------------------------------------
 local _NUDGE_PROMPTS = {
   "You appear to have stopped mid-task. Continue from where you left off "
     .. "and write the remaining file(s). Output DONE on its own line when complete.",
@@ -455,12 +498,23 @@ local _NUDGE_PROMPTS = {
   "One final push — complete the remaining implementation and output DONE.",
 }
 
-M.FIX_NUDGE_PROMPT =
-  "Continue fixing the errors. Output DONE when all errors are resolved."
+local _FIX_NUDGE_PROMPTS = {
+  "Continue fixing the errors. Output DONE when all errors are resolved.",
+  "Keep going — there are still errors to fix. Address each ERROR: line and output DONE.",
+  "You have not finished fixing the errors. Re-read the failing file and fix it now, then output DONE.",
+  "Final fix round — correct every remaining error and output DONE. Do not re-read files you already fixed.",
+}
 
 function M.get_nudge(count)
   return _NUDGE_PROMPTS[((count - 1) % #_NUDGE_PROMPTS) + 1]
 end
+
+function M.get_fix_nudge(round)
+  return _FIX_NUDGE_PROMPTS[((round - 1) % #_FIX_NUDGE_PROMPTS) + 1]
+end
+
+-- Keep the old static field for any callers that reference it directly
+M.FIX_NUDGE_PROMPT = _FIX_NUDGE_PROMPTS[1]
 
 -- ---------------------------------------------------------------------------
 -- validate — called by hot_reload after a rewrite.
