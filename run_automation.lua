@@ -562,7 +562,11 @@ local function classify_input(input, model, session_ctx)
   if fast_intent then return fast_intent, nil end
 
   -- AI classification
-  logging.dim and io.write(logging.dim("  [classifying...]\r")) or io.write("  [classifying...]\r")
+  if logging.dim then
+    io.write(logging.dim("  [classifying...]\r"))
+  else
+    io.write("  [classifying...]\r")
+  end
 
   local classify_prompt = prompts.build_classify_prompt({
     input           = input,
