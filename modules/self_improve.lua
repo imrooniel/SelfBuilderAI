@@ -150,20 +150,27 @@ end
 -- ---------------------------------------------------------------------------
 -- Targeted improvement — called after task failure or compile errors
 -- ---------------------------------------------------------------------------
-function M.run_targeted(model, reason, context)
+function M.run_targeted(model, opts)
   if not cfg.SELF_IMPROVE_ENABLED or not cfg.SELF_IMPROVE_TARGETED then
     logging.log("[self_improve] Targeted pass disabled in config — skipping.")
     return
   end
 
+  -- Extract reason and use opts as context
+  local reason = opts.reason or "unspecified"
+  local context = opts
+  
   logging.log("[self_improve] Targeted pass — reason: " .. reason)
 
   -- Decide which modules are most relevant to the failure
   local targets = {}
-  if context.target_override then
-    -- Caller specified exact module(s) — honour it directly
+  if context.target_module then
+    -- Caller specified exact module — use it directly
+    targets = { context.target_module }
+  elseif context.target_override then
+    -- Caller specified exact module(s) list — honour it directly
     targets = context.target_override
-  elseif reason == "user_request" then
+  elseif reason == "user_request" or reason:match("^improve") then
     -- User typed something like "improve yourself" with no specific module.
     -- Default to the two highest-value modules for general improvement.
     targets = { "prompts", "self_improve" }
@@ -181,7 +188,7 @@ function M.run_targeted(model, reason, context)
   end
 
   local progress = read_progress()
-  local run_ts   = os.date("%Y%m%d-%H%M%S")
+  local run_ts   = opts.run_ts or os.date("%Y%m%d-%H%M%S")
 
   for _, mod_name in ipairs(targets) do
     -- Prefer the live source tracked by hot_reload; fall back to reading from

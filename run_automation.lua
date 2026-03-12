@@ -1,9 +1,8 @@
 #!/usr/bin/env lua
 --[[
   run_automation.lua — KERNEL (read-only to the AI agent)
-  v2.1.0
 
-  A general-purpose AI agent orchestrator implementing the Ralph pattern
+  SelfBuilderAI - a general-purpose AI agent orchestrator implementing the Ralph pattern
   (fresh-context outer loop + continue-nudge inner loop) with self-improvement.
 
   Supported project types (configured in modules/config.lua):
@@ -296,6 +295,7 @@ local function run_task(task_num, task_text, all_tasks, model, version, has_sour
         if cfg.SELF_IMPROVE_ENABLED and cfg.SELF_IMPROVE_TARGETED then
           logging.log("[SELF-IMPROVE] Compile failed — running targeted improvement pass...")
           self_improve.run_targeted(model, {
+            reason     = "compile_failure",
             task_num   = task_num,
             task_text  = task_text,
             error_out  = error_out,
@@ -443,9 +443,9 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
       end
 
       self_improve.run_targeted(model, {
-        reason       = input,
+        reason        = input:match("^%s*(.-)%s*$"), -- trim whitespace
         target_module = target_module,
-        run_ts       = run_ts,
+        run_ts        = run_ts,
       })
       __refresh_modules()
       logging.ok("Self-improvement pass complete.")
