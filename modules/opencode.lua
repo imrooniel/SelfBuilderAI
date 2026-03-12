@@ -217,25 +217,38 @@ function M.run_continue(log_file, session_id, nudge, model)
 end
 
 -- ---------------------------------------------------------------------------
--- run_classify — lightweight non-streaming call for structured short responses.
--- Does NOT stream to stdout or write a log file. Returns the raw output string.
--- Intended for classification / routing decisions, not code generation.
+-- run_classify — lightweight call for structured short responses.
+-- CHANGED: Now streams output to stdout AND captures it for return value.
+-- Intended for classification / routing decisions and query responses.
 -- ---------------------------------------------------------------------------
 function M.run_classify(prompt, model)
   local prompt_file = os.tmpname()
   local pf = io.open(prompt_file, "w")
   if pf then pf:write(prompt); pf:close() end
 
+  -- Stream to stdout while also capturing
   local cmd = string.format(
-    '"%s" run --model "%s" "$(cat %s)" 2>/dev/null',
+    '"%s" run --model "%s" "$(cat %s)" 2>&1',
     cfg.OPENCODE, model, prompt_file)
 
+  logging.log("Sending query to model...")
+  print()
+  
+  reset_think_state()
   local handle = io.popen(cmd)
-  local output = handle and handle:read("*a") or ""
-  if handle then handle:close() end
+  local lines = {}
+  if handle then
+    for line in handle:lines() do
+      classify_and_print(line)
+      -- Also capture for return value
+      lines[#lines+1] = line
+    end
+    handle:close()
+  end
   os.remove(prompt_file)
 
-  -- Strip ANSI codes and carriage returns
+  local output = table.concat(lines, "\n")
+  -- Strip ANSI codes and carriage returns from captured output
   output = output:gsub("\027%[[%d;]*%a", ""):gsub("\r", "")
   return output
 end
