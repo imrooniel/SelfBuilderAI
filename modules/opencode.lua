@@ -48,6 +48,11 @@ local function classify_and_print(line)
     return
   end
 
+  if stripped:upper() == "REFLECTION_OK" then
+    print(logging.bold_green(line))
+    return
+  end
+
   local tool_markers = {
     "running tool", "tool result", "● ", "✓ ", "✗ ", "→ ", "⟳ ",
     "calling ", "read_file", "write_file", "bash", "grep", "find",
@@ -132,6 +137,23 @@ function M.log_says_done(log_path)
     local clean = line:gsub("\027%[[%d;]*%a", ""):gsub("\r", "")
     -- Trim leading/trailing whitespace then check for exact DONE
     if clean:match("^%s*DONE%s*$") then
+      f:close(); return true
+    end
+  end
+  f:close()
+  return false
+end
+
+-- ---------------------------------------------------------------------------
+-- log_says_reflection_ok — detect REFLECTION_OK marker in log.
+-- This indicates the model has reviewed its work and found it satisfactory.
+-- ---------------------------------------------------------------------------
+function M.log_says_reflection_ok(log_path)
+  local f = io.open(log_path, "r")
+  if not f then return false end
+  for line in f:lines() do
+    local clean = line:gsub("\027%[[%d;]*%a", ""):gsub("\r", "")
+    if clean:match("^%s*REFLECTION_OK%s*$") then
       f:close(); return true
     end
   end

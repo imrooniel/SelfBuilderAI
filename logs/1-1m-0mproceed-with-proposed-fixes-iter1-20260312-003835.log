@@ -1,0 +1,9 @@
+$ "/home/patryk/.opencode/bin/opencode" run --model "ollama/qwen3.5:35b-256k" --title "task-1773272932-8016" "$(cat /tmp/lua_NJ9iof)"
+[0m
+> build · qwen3.5:35b-256k
+[0m
+[91m[1mError: [0mUnable to connect. Is the computer able to access the url?
+$ "/home/patryk/.opencode/bin/opencode" run --model "ollama/qwen3.5:35b-256k" --continue --session "ses_320b25b52ffeUJY75LUh19LIi6" "$(cat /tmp/lua_aUHFEC)"
+[0m
+> build · qwen3.5:35b-256k
+[0m

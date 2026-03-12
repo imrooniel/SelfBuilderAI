@@ -27,10 +27,10 @@ local _registry = {}
 local CONTRACTS = {
   prompts = {
     "build_task_prompt", "build_fix_prompt", "build_self_improve_prompt",
-    "build_query_prompt", "build_classify_prompt", "get_nudge",
+    "build_query_prompt", "build_reflection_prompt", "get_nudge", "get_fix_nudge",
   },
   opencode = {
-    "run_fresh", "run_continue", "run_classify", "log_says_done",
+    "run_fresh", "run_continue", "run_classify", "log_says_done", "log_says_reflection_ok",
   },
   compile = {
     "run_compile_check", "read_errors", "read_errors_raw",

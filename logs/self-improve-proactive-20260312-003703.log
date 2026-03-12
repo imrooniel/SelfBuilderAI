@@ -1,0 +1,25 @@
+$ "/home/patryk/.opencode/bin/opencode" run --model "ollama/qwen3.5:35b-256k" --title "task-1773272223-d966" "$(cat /tmp/lua_cVzlys)"
+[0m
+> build · qwen3.5:35b-256k
+[0m
+Based on analyzing the codebase, I've identified two modules that would benefit from targeted improvements:
+
+## Key Issues Found:
+
+1. **self_improve.lua**: The `extract_lua_source` function has overly complex logic with potential edge cases in parsing AI output. Could be simplified and made more robust.
+
+2. **prompts.lua**: Contains hardcoded prompt templates that are duplicated across multiple places, making maintenance difficult and error-prone.
+
+## Proposed Improvements:
+
+### 1. self_improve.lua
+- Simplify the Lua source extraction logic to reduce complexity
+- Improve error handling for malformed AI responses
+- Make the module path resolution more resilient
+
+### 2. prompts.lua  
+- Centralize prompt template management
+- Reduce duplication of common structures (task context, session data blocks)
+- Add validation that prompts are well-formed
+
+Would you like me to proceed with rewriting these two modules?

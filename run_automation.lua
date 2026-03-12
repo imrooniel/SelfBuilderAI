@@ -1,7 +1,7 @@
 #!/usr/bin/env lua
 --[[
   run_automation.lua — KERNEL (read-only to the AI agent)
-  v2.0.0
+  v2.1.0
 
   A general-purpose AI agent orchestrator implementing the Ralph pattern
   (fresh-context outer loop + continue-nudge inner loop) with self-improvement.
@@ -38,7 +38,7 @@
 -- ---------------------------------------------------------------------------
 -- Kernel version — bump manually when you apply AI suggestions
 -- ---------------------------------------------------------------------------
-KERNEL_VERSION = "2.0.0"
+KERNEL_VERSION = "2.2.0"
 
 -- ---------------------------------------------------------------------------
 -- Resolve script directory so require() works from any cwd
@@ -193,631 +193,264 @@ end
 -- Single-task runner
 -- ---------------------------------------------------------------------------
 local function run_task(task_num, task_text, all_tasks, model, version, has_sources, run_ts, session_context)
-  __refresh_modules()
+  local log_file    = string.format("%s/logs/%s-task-%s-%s.log",
+    cfg.PROJECT_PATH, run_ts, task_num, task_slug(task_text))
+  local error_out   = cfg.PROJECT_PATH .. "/.ralph-errors"
+  local slug        = task_slug(task_text)
+  local tool_ctx    = tool_reg.describe_tools()
+  local section_ctx = all_tasks and todo_parser.build_section_context(all_tasks) or ""
 
-  session_context = session_context or ""
-
-  local slug       = task_slug(task_text)
-  local task_start = os.time()
-
-  print()
-  logging.header("============================================")
-  logging.header(string.format("[TASK #%s] %s", task_num, task_text))
-  logging.header(string.format("  Type: %s | Version: %s", cfg.PROJECT_TYPE, version))
-  logging.header("============================================")
-
+  -- Ensure logs dir exists
   os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. '/logs"')
 
-  local before_snapshot = git_utils.snapshot_files()
-  local section_context = all_tasks and todo_parser.build_section_context(all_tasks) or ""
+  -- Fresh start
+  logging.header(string.format("\n[TASK #%s] %s", task_num, task_text))
+  logging.log("Log: " .. log_file)
 
-  local iteration   = 0
-  local said_done   = false
-  local changed     = {}
-  local prior_note  = "No details recorded."
-  local nudge_count = 0
+  local function session_context_fn()
+    return type(session_context) == "function" and session_context() or (session_context or "")
+  end
 
-  -- ----------------------------------------------------------------
-  -- OUTER loop — Ralph pattern, fresh context each iteration
-  -- ----------------------------------------------------------------
-  while iteration < cfg.MAX_ITERATIONS and not said_done do
-    iteration = iteration + 1
-    local log_file = string.format("%s/logs/%s-%s-iter%d-%s.log",
-      cfg.PROJECT_PATH, task_num, slug, iteration, run_ts)
-
-    local f = io.open(log_file, "w"); if f then f:close() end
-
-    logging.log(string.format(
-      "Ralph iteration %d/%d — fresh context | log: %s",
-      iteration, cfg.MAX_ITERATIONS,
-      log_file:gsub(cfg.PROJECT_PATH .. "/", "")))
-    print()
-
-    local tool_context = tool_reg.describe_tools()
+  -- Outer loop: fresh context attempts
+  for iteration = 1, cfg.MAX_ITERATIONS do
+    local prior_note = "No details recorded."
+    if iteration > 1 then
+      local pf = io.open(cfg.PROJECT_PATH .. "/" .. cfg.PROGRESS_FILE, "r")
+      if pf then
+        local content = pf:read("*a"); pf:close()
+        local last_block = content:match("\n## %[.-%] Task #" .. task_num .. ":(.-)\n## %[") or ""
+        prior_note = last_block ~= "" and last_block or "Previous iteration made no changes"
+      end
+    end
 
     local prompt = prompts.build_task_prompt({
       task_num        = task_num,
       task_text       = task_text,
-      section_context = section_context,
+      section_context = section_ctx,
       iteration       = iteration,
       prior_note      = prior_note,
       version         = version,
-      tool_context    = tool_context,
-      session_context = session_context,
+      tool_context    = tool_ctx,
+      session_context = session_context_fn(),
     })
 
-    local _, current_session = opencode.run_fresh(log_file, prompt, model)
-    changed   = git_utils.files_changed_since(before_snapshot)
-    said_done = opencode.log_says_done(log_file)
+    logging.step("ITERATION", string.format("%d/%d", iteration, cfg.MAX_ITERATIONS))
+    local _, session_id = opencode.run_fresh(log_file, prompt, model)
+
+    -- Inner loop: continue nudges
+    local continue_count = 0
+    while continue_count < cfg.MAX_CONTINUES and not opencode.log_says_done(log_file) do
+      continue_count = continue_count + 1
+      logging.step("NUDGE", string.format("%d/%d", continue_count, cfg.MAX_CONTINUES))
+      opencode.run_continue(log_file, session_id, prompts.get_nudge(continue_count), model)
+    end
 
     tool_reg.process_tool_calls(log_file, task_num, run_ts)
 
-    if said_done then break end
-
-    -- ----------------------------------------------------------------
-    -- INNER loop — continue nudges within the same session
-    -- ----------------------------------------------------------------
-    nudge_count = 0
-    while not said_done and nudge_count < cfg.MAX_CONTINUES do
-      nudge_count = nudge_count + 1
-      logging.log(string.format("Continue nudge %d/%d ...", nudge_count, cfg.MAX_CONTINUES))
-      print()
-
-      opencode.run_continue(log_file, current_session, prompts.get_nudge(nudge_count), model)
-      changed   = git_utils.files_changed_since(before_snapshot)
-      said_done = opencode.log_says_done(log_file)
-
-      tool_reg.process_tool_calls(log_file, task_num, run_ts)
-
-      if said_done then break end
-
-      if #changed == 0 and nudge_count >= 2 then
-        logging.log(string.format(
-          "No progress after %d nudges — escalating to fresh Ralph iteration.", nudge_count))
-        break
-      end
-    end
-
-    if said_done then break end
-
-    -- Build note for next Ralph iteration
-    if #changed > 0 then
-      local names = {}
-      for i = 1, math.min(5, #changed) do
-        names[#names+1] = changed[i]:gsub(cfg.PROJECT_PATH .. "/", "")
-      end
-      prior_note = string.format(
-        "Files were modified but DONE was not output after %d nudge(s). Changed: %s. Complete remaining work.",
-        nudge_count, table.concat(names, ", "))
-      logging.log("Files changed but DONE not detected — Ralph fresh restart...")
-    else
-      prior_note = string.format(
-        "No files were created or modified after %d nudge(s). Try a completely different approach.",
-        nudge_count)
-      logging.log("No progress after inner loop — Ralph fresh restart...")
-    end
-
-    session.append_progress(task_num, task_text,
-      string.format("Ralph iteration %d incomplete (%d nudges). %s", iteration, nudge_count, prior_note))
-  end
-
-  local elapsed = os.time() - task_start
-
-  -- ----------------------------------------------------------------
-  -- Success path — DONE is required; files changed without DONE is a warning
-  -- ----------------------------------------------------------------
-  if said_done then
-    if #changed > 0 then
-      logging.ok(string.format("Task #%s complete! (DONE + %d file(s) changed) [iter=%d, nudges=%d, %ds]",
-        task_num, #changed, iteration, nudge_count, elapsed))
-    else
-      logging.ok(string.format("Task #%s complete! (DONE, no file changes) [iter=%d, nudges=%d, %ds]",
-        task_num, iteration, nudge_count, elapsed))
-    end
-
-    -- ---- Compile / check pass ----
-    local fix_round     = 0
-    local compile_clean = true
-
-    local profile = project_type.resolve(cfg)
-    if not profile.compile then
-      logging.log(string.format(
-        "No compile check defined for project type '%s' — skipping.", cfg.PROJECT_TYPE))
-    else
-      local compile_error_file = string.format("%s/logs/%s-compile-errors-%s.txt",
-        cfg.PROJECT_PATH, task_num, run_ts)
-
-      logging.log(string.format(
-        "Running compile/check pass [%s]...", cfg.PROJECT_TYPE))
-
-      if not compile.run_compile_check(compile_error_file) then
-        compile_clean = false
-        local errors = compile.read_errors(compile_error_file)
-        logging.warn(string.format("Compile/check errors detected (%d):", #errors))
-        for _, e in ipairs(errors) do print("          " .. e) end
-      else
-        logging.ok("Compile/check passed.")
-      end
-
-      while not compile_clean and fix_round < cfg.MAX_FIX_ROUNDS do
-        fix_round = fix_round + 1
-        logging.log(string.format("Fix round %d/%d — fresh context...", fix_round, cfg.MAX_FIX_ROUNDS))
-        print()
-
-        local fix_log = string.format("%s/logs/%s-fix%d-%s.log",
-          cfg.PROJECT_PATH, task_num, fix_round, run_ts)
-        local f2 = io.open(fix_log, "w"); if f2 then f2:close() end
-
-        local errors_text = compile.read_errors_raw(compile_error_file)
-        local fix_prompt  = prompts.build_fix_prompt({
-          task_num        = task_num,
-          task_text       = task_text,
-          compile_errors  = errors_text,
-          version         = version,
-          session_context = session_context,
-        })
-
-        local _, fix_session = opencode.run_fresh(fix_log, fix_prompt, model)
-
-        local fix_nudge = 0
-        while not opencode.log_says_done(fix_log) and fix_nudge < 4 do
-          fix_nudge = fix_nudge + 1
-          logging.log(string.format("Fix continue nudge %d/4...", fix_nudge))
-          local fix_nudge_text = type(prompts.get_fix_nudge) == "function"
-            and prompts.get_fix_nudge(fix_nudge)
-            or  prompts.FIX_NUDGE_PROMPT   -- fallback for old prompts.lua
-          opencode.run_continue(fix_log, fix_session, fix_nudge_text, model)
-        end
-
-        logging.log(string.format("Re-running compile check after fix round %d...", fix_round))
-        if compile.run_compile_check(compile_error_file) then
-          compile_clean = true
-          logging.ok(string.format("Errors resolved after fix round %d.", fix_round))
-          break
-        else
-          local errs = compile.read_errors(compile_error_file)
-          logging.warn(string.format("Still has errors after fix round %d (%d errors):", fix_round, #errs))
-          for _, e in ipairs(errs) do print("          " .. e) end
-        end
-      end
-
-      if not compile_clean then
-        logging.warn(string.format(
-          "Errors remain after %d fix round(s) — committing for manual review.", cfg.MAX_FIX_ROUNDS))
-      end
-
-      -- Targeted self-improvement on persistent compile failure
-      if not compile_clean then
-        local compile_error_file2 = string.format("%s/logs/%s-compile-errors-%s.txt",
-          cfg.PROJECT_PATH, task_num, run_ts)
-        logging.log("[SELF-IMPROVE] Compile errors persisted — running targeted improvement pass...")
-        self_improve.run_targeted(model, "compile_failure", {
+    if opencode.log_says_done(log_file) then
+      -- Self-reflection pass (if enabled)
+      if cfg.SELF_REFLECTION_ENABLED then
+        logging.step("REFLECT", "Running self-review...")
+        local reflection_prompt = prompts.build_reflection_prompt({
           task_num  = task_num,
           task_text = task_text,
-          errors    = compile.read_errors_raw(compile_error_file2),
+          version   = version,
         })
-        __refresh_modules()
+        opencode.run_continue(log_file, session_id, reflection_prompt, model)
+
+        -- Give model a chance to fix issues it found
+        local reflection_round = 0
+        while reflection_round < cfg.SELF_REFLECTION_MAX_ROUNDS do
+          if opencode.log_says_reflection_ok(log_file) then
+            logging.ok("Self-reflection passed — model approved its work")
+            break
+          end
+          
+          if opencode.log_says_done(log_file) then
+            logging.log("Model made corrections during reflection")
+            break
+          end
+
+          reflection_round = reflection_round + 1
+          if reflection_round < cfg.SELF_REFLECTION_MAX_ROUNDS then
+            logging.step("REFLECT", string.format("nudge %d/%d", reflection_round, cfg.SELF_REFLECTION_MAX_ROUNDS))
+            opencode.run_continue(log_file, session_id,
+              "Continue your self-review. Fix any remaining issues or output REFLECTION_OK if satisfied.", model)
+          end
+        end
       end
-    end
 
-    git_utils.git_commit(task_num, slug, task_text, compile_clean)
+      -- Compile/check pass
+      local fix_round = 0
+      while fix_round < cfg.MAX_FIX_ROUNDS do
+        local clean = compile.run_compile_check(error_out)
+        if clean then
+          git_utils.git_commit(task_num, slug, task_text, true)
+          session.append_progress(task_num, task_text, "Task completed successfully.")
+          if all_tasks then todo_parser.mark_task_done(task_num, task_text) end
+          logging.ok("DONE — clean compile, moving on.")
+          return true
+        end
 
-    -- Auto-update AGENTS.md with a brief record of what was done.
-    -- This makes the agents file a living document even when the model skips writing to it.
-    local af = io.open(cfg.PROJECT_PATH .. "/" .. cfg.AGENTS_FILE, "a")
-    if af then
-      local files_str = #changed > 0
-        and table.concat(changed, ", "):gsub(cfg.PROJECT_PATH .. "/", "")
-        or  "no files changed"
-      af:write(string.format("\n- [%s] Task #%s: %s → %s\n",
-        os.date("%Y-%m-%d"), task_num, task_text, files_str))
-      af:close()
-    end
+        -- Targeted self-improvement on compile failure
+        if cfg.SELF_IMPROVE_ENABLED and cfg.SELF_IMPROVE_TARGETED then
+          logging.log("[SELF-IMPROVE] Compile failed — running targeted improvement pass...")
+          self_improve.run_targeted(model, {
+            task_num   = task_num,
+            task_text  = task_text,
+            error_out  = error_out,
+            log_file   = log_file,
+            run_ts     = run_ts,
+          })
+          __refresh_modules()
+        end
 
-    -- Mark done in todo.md only when called from todo-driven mode
-    if all_tasks then
-      todo_parser.mark_task_done(task_num, task_text)
-      for _, t in ipairs(all_tasks) do
-        if t.num == task_num then t.state = "done"; break end
+        fix_round = fix_round + 1
+        logging.step("FIX", string.format("round %d/%d", fix_round, cfg.MAX_FIX_ROUNDS))
+
+        local fix_prompt = prompts.build_fix_prompt({
+          task_num    = task_num,
+          task_text   = task_text,
+          error_out   = error_out,
+          round       = fix_round,
+          version     = version,
+        })
+        opencode.run_continue(log_file, session_id, fix_prompt, model)
+
+        local fix_nudges = 0
+        while fix_nudges < 2 and not opencode.log_says_done(log_file) do
+          fix_nudges = fix_nudges + 1
+          opencode.run_continue(log_file, session_id, prompts.get_fix_nudge(fix_round), model)
+        end
       end
+
+      -- Exceeded fix rounds
+      git_utils.git_commit(task_num, slug, task_text, false)
+      session.append_progress(task_num, task_text, "Task completed but compile errors remain.")
+      logging.warn("Compile errors persist after max fix rounds.")
+      return false
     end
-
-    session.append_progress(task_num, task_text,
-      string.format("Completed in %d iteration(s) [%ds]. Compile clean: %s.",
-        iteration, elapsed, tostring(compile_clean)))
-
-    return true
   end
 
-  -- ----------------------------------------------------------------
-  -- Partial path — files changed but DONE never output
-  -- ----------------------------------------------------------------
-  if #changed > 0 then
-    logging.warn(string.format(
-      "Task #%s: %d file(s) changed but DONE was never output — treating as incomplete. [iter=%d, %ds]",
-      task_num, #changed, iteration, elapsed))
-    session.append_progress(task_num, task_text,
-      string.format("PARTIAL after %d iteration(s): files changed but no DONE. Review manually.", iteration))
-    git_utils.git_commit(task_num, slug, task_text, false)
-    return false
-  end
-
-  -- ----------------------------------------------------------------
-  -- Failure path
-  -- ----------------------------------------------------------------
-  logging.err(string.format(
-    "Task #%s failed after %d Ralph iteration(s) / %d nudge(s) [%ds]",
-    task_num, iteration, nudge_count, elapsed))
-
-  session.append_progress(task_num, task_text,
-    string.format("FAILED after %d iteration(s). Manual intervention required.", iteration))
-
-  -- Targeted self-improvement + kernel suggestion on failure
-  logging.log("[SELF-IMPROVE] Task failed — running targeted improvement pass...")
-  self_improve.run_targeted(model, "task_failure", {
-    task_num   = task_num,
-    task_text  = task_text,
-    prior_note = prior_note,
-    iterations = iteration,
-    nudges     = nudge_count,
-  })
-  __refresh_modules()
-
-  logging.log("[KERNEL] Task failed — running kernel suggestion pass...")
-  self_improve.suggest_kernel_improvements(model, {
-    task_num   = task_num,
-    task_text  = task_text,
-    prior_note = prior_note,
-  })
-
+  -- Exceeded iteration limit
+  git_utils.git_commit(task_num, slug, task_text, false)
+  session.append_progress(task_num, task_text, "Task incomplete after max iterations.")
+  logging.warn("Max iterations reached without completion.")
   return false
 end
 
 -- ---------------------------------------------------------------------------
--- readline_input — rich prompt using Python's readline
--- ---------------------------------------------------------------------------
-local _readline_helper_path = nil
-
-local function ensure_readline_helper()
-  if _readline_helper_path then return _readline_helper_path end
-
-  -- Check if the helper already exists at either candidate location
-  local candidates = {
-    cfg.PROJECT_PATH .. "/.ralph-readline-helper.py",
-    BASE_DIR .. ".ralph-readline-helper.py",
-  }
-  for _, path in ipairs(candidates) do
-    local f = io.open(path, "r")
-    if f then f:close(); _readline_helper_path = path; return path end
-  end
-
-  -- Write it fresh to the first writable location
-  local write_path = nil
-  local f = nil
-  for _, path in ipairs(candidates) do
-    f = io.open(path, "w")
-    if f then write_path = path; break end
-  end
-  if not f then return nil end
-
-  f:write([[
-import sys, os
-try:
-    import readline
-except ImportError:
-    try:
-        line = input("")
-        print(line)
-    except EOFError:
-        sys.exit(1)
-    sys.exit(0)
-
-history_file = sys.argv[1] if len(sys.argv) > 1 else None
-prompt       = sys.argv[2] if len(sys.argv) > 2 else "> "
-
-if history_file:
-    try:
-        readline.read_history_file(history_file)
-    except FileNotFoundError:
-        pass
-    readline.set_history_length(500)
-
-try:
-    lines = []
-    current_prompt = prompt
-    while True:
-        part = input(current_prompt)
-        if part.endswith("\\"):
-            lines.append(part[:-1])
-            current_prompt = "... "
-        else:
-            lines.append(part)
-            break
-    result = "\n".join(lines)
-    print(result)
-except EOFError:
-    if history_file:
-        readline.write_history_file(history_file)
-    sys.exit(1)
-
-if history_file:
-    readline.write_history_file(history_file)
-]])
-  f:close()
-  _readline_helper_path = write_path
-  return write_path
-end
-
-local function readline_input(prompt)
-  local helper       = ensure_readline_helper()
-  local history_file = cfg.PROJECT_PATH .. "/.ralph-repl-history"
-
-  if helper then
-    local safe_prompt  = prompt:gsub("'", "'\\''")
-    local safe_history = history_file:gsub("'", "'\\''")
-    local cmd = string.format("python3 '%s' '%s' '%s'", helper, safe_history, safe_prompt)
-    local handle = io.popen(cmd)
-    if handle then
-      local output = handle:read("*a")
-      local ok = handle:close()
-      if not ok then return nil end
-      output = output:gsub("%s+$", "")
-      if output == "" then return nil end
-      return output
-    end
-  end
-
-  io.write(prompt)
-  local line = io.read()
-  if not line then return nil end
-  return line:match("^%s*(.-)%s*$")
-end
-
--- ---------------------------------------------------------------------------
--- classify_input — AI-powered intent classifier.
---
--- Returns: intent ("task" | "self_improve" | "query"), module_target (or nil)
---
--- Fast-path: a small set of unambiguous regex patterns are checked first so
--- trivially obvious inputs (bare "?" prefix, trailing "?") don't pay the cost
--- of an LLM call. Everything else goes to the model.
--- ---------------------------------------------------------------------------
-
--- Unambiguous fast-path patterns — only used for cases where no reasonable
--- human would mean anything other than what the pattern says.
--- This eliminates the model round-trip for the majority of typical inputs.
-local function fast_classify(s)
-  -- Explicit query override prefix
-  if s:sub(1, 1) == "?" then return "query", nil end
-  -- Bare question mark ending with no leading verb
-  if s:match("%?%s*$") and not s:match("^%a+%s") then return "query", nil end
-
-  -- Self-improve: clear imperative phrases about the orchestrator itself
-  local si_phrases = {
-    "improve yourself", "improve ralph", "improve the orchestrat",
-    "rewrite yourself", "fix yourself", "update yourself",
-  }
-  for _, p in ipairs(si_phrases) do
-    if s:find(p, 1, true) then return "self_improve", nil end
-  end
-  -- "improve <module_name>" — single-word target after "improve"
-  local mod = s:match("^improve%s+([%w_]+)$")
-  if mod and mod ~= "yourself" and mod ~= "ralph" and mod ~= "the" then
-    return "self_improve", mod
-  end
-  -- "improve prompts/opencode/etc" with trailing words still counts
-  local si_mod = s:match("^improve%s+([%w_]+)%s")
-  if si_mod then
-    local known = { config=1, logging=1, session=1, todo_parser=1, git_utils=1,
-                    compile=1, prompts=1, opencode=1, hot_reload=1,
-                    tool_registry=1, self_improve=1, project_type=1 }
-    if known[si_mod] then return "self_improve", si_mod end
-  end
-
-  -- Task: strong imperative verbs acting on project content
-  local task_verbs = {
-    "^add%s", "^create%s", "^build%s", "^write%s", "^implement%s",
-    "^refactor%s", "^delete%s", "^remove%s", "^rename%s", "^move%s",
-    "^update%s", "^change%s", "^make%s", "^generate%s", "^scaffold%s",
-  }
-  for _, p in ipairs(task_verbs) do
-    if s:find(p) then return "task", nil end
-  end
-
-  -- Fix/debug — task unless it's clearly about the orchestrator
-  if s:find("^fix%s") and not s:find("ralph") and not s:find("orchestrat") then
-    return "task", nil
-  end
-
-  return nil, nil  -- ambiguous — use AI
-end
-
-local function classify_input(input, model, session_ctx)
-  local s = input:lower():match("^%s*(.-)%s*$")
-
-  -- Fast path for trivially obvious cases
-  local fast_intent = fast_classify(s)
-  if fast_intent then return fast_intent, nil end
-
-  -- AI classification
-  if logging.dim then
-    io.write(logging.dim("  [classifying...]\r"))
-  else
-    io.write("  [classifying...]\r")
-  end
-
-  local classify_prompt = prompts.build_classify_prompt({
-    input           = input,
-    session_context = session_ctx or "",
-  })
-
-  local raw = opencode.run_classify(classify_prompt, model)
-
-  -- Parse response: first non-empty line is the intent, optional second is MODULE:
-  local intent     = nil
-  local mod_target = nil
-  for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
-    line = line:match("^%s*(.-)%s*$")
-    if line ~= "" then
-      if not intent then
-        local upper = line:upper()
-        if upper:find("SELF_IMPROVE") or upper:find("SELF-IMPROVE") then
-          intent = "self_improve"
-        elseif upper:find("QUERY") then
-          intent = "query"
-        elseif upper:find("TASK") then
-          intent = "task"
-        end
-      elseif line:upper():match("^MODULE:%s*(.+)") then
-        mod_target = line:match("^[Mm][Oo][Dd][Uu][Ll][Ee]:%s*(.+)")
-        mod_target = mod_target and mod_target:match("^%s*(.-)%s*$")
-        break
-      end
-    end
-  end
-
-  -- Clear the classifying... line
-  io.write(string.rep(" ", 20) .. "\r")
-
-  -- Fallback: if the model returned something unparseable, default to task
-  if not intent then
-    logging.warn("Classifier returned unrecognised response — defaulting to task.")
-    intent = "task"
-  end
-
-  return intent, mod_target
-end
-
--- ---------------------------------------------------------------------------
--- run_self_improve_interactive — handle user-initiated self-improvement.
--- ---------------------------------------------------------------------------
-local function run_self_improve_interactive(input, model, run_ts, mod_target)
-  if mod_target then
-    logging.step("SELF-IMPROVE", "Targeted: module " .. mod_target)
-    self_improve.run_targeted(model, "user_request", {
-      task_num        = "interactive",
-      task_text       = input,
-      prior_note      = "User explicitly requested improvement of module: " .. mod_target,
-      target_override = { mod_target },
-    })
-  else
-    logging.step("SELF-IMPROVE", "General pass (user-initiated)")
-    self_improve.run_proactive(model, {
-      tasks_done   = 0,
-      tasks_failed = 0,
-      failed_nums  = {},
-      run_ts       = run_ts,
-      user_request = input,
-    })
-  end
-  __refresh_modules()
-end
-
--- ---------------------------------------------------------------------------
--- run_query — one-shot Q&A, no Ralph loop, no compile check, no git commit
--- ---------------------------------------------------------------------------
-local function run_query(question, model, version, run_ts, session_context)
-  -- Strip leading "?" override prefix if present
-  local clean = question:match("^%s*%?%s*(.-)%s*$") or question
-
-  logging.step("QUERY", clean:sub(1, 60))
-
-  os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. '/logs"')
-  local log_file = string.format("%s/logs/query-%s.log",
-    cfg.PROJECT_PATH, run_ts)
-
-  local prompt = prompts.build_query_prompt({
-    question        = clean,
-    version         = version,
-    session_context = session_context or "",
-  })
-
-  opencode.run_fresh(log_file, prompt, model)
-  print()
-  -- Print a clear visual delimiter so the user knows the answer is complete
-  -- and the REPL is ready for further input. Without this, the prompt reappears
-  -- silently and it looks like the system stalled.
-  logging.step("READY", "Query answered. Ask another question or describe a task.")
-end
-
--- ---------------------------------------------------------------------------
--- Interactive REPL
+-- Interactive loop — replaced automatic classification with explicit menu
 -- ---------------------------------------------------------------------------
 local function run_interactive_loop(model, version, has_sources, branch_name)
-  local tech = project_type.get_tech(cfg)
-
-  logging.header("============================================")
-  logging.header("Interactive mode  (no todo.md found)")
-  logging.header(string.format("Project type: %s | Tech: %s", cfg.PROJECT_TYPE, tech))
-  logging.header("Ask a question or describe what you want built.")
-  logging.header("Tips: ↑/↓ history  |  Ctrl-R search  |  \\ to continue on next line")
-  logging.header("Prefix input with ? to force question mode (no file writes).")
-  logging.header("Type  quit  or  exit  (or Ctrl-D) to end the session.")
-  logging.header("============================================")
-  print()
-
-  local task_counter  = 0
-  local tasks_done    = 0
-  local tasks_failed  = 0
+  local tasks_done   = 0
+  local tasks_failed = 0
   local failed_labels = {}
-  local run_ts        = os.date("%Y%m%d-%H%M%S")
-  local prompt        = logging.bold_white("\n> ")
+  local task_counter = 0
+  local run_ts       = os.date("%Y%m%d-%H%M%S")
+  local journal      = {}
 
-  -- Session journal: an ordered list of records describing what has been done.
-  -- Each entry is a plain string injected verbatim into every subsequent prompt
-  -- so the model always knows what already exists in the project.
-  -- Format: "Task #N [status]: <description> → files: <list>"
-  local journal = {}
-
-  -- Build the session_context string from accumulated journal entries.
-  -- Returns "" when the journal is empty (first task — no history yet).
   local function session_context()
     if #journal == 0 then return "" end
-    return table.concat(journal, "\n")
+    local max = cfg.CTX_JOURNAL_ENTRIES or 10
+    if #journal <= max then return table.concat(journal, "\n") end
+    local tail = {}
+    for i = #journal - max + 1, #journal do tail[#tail+1] = journal[i] end
+    return "[... " .. (#journal - max) .. " earlier entries omitted ...]\n" .. table.concat(tail, "\n")
   end
 
-  -- Record a completed task in the journal, including which files changed.
-  local function journal_record(num, text, status, changed_files)
-    local files_str = #changed_files > 0
-      and table.concat(changed_files, ", ")
+  local function journal_record(task_num, task_text, status, changed)
+    local files_str = #changed > 0
+      and table.concat(changed, ", "):gsub(cfg.PROJECT_PATH .. "/", "")
       or  "no files changed"
-    -- Strip PROJECT_PATH prefix from file paths for readability
-    files_str = files_str:gsub(cfg.PROJECT_PATH .. "/", "")
-    journal[#journal+1] = string.format(
-      "Task #%s [%s]: %s → files: %s", num, status, text, files_str)
+    journal[#journal+1] = string.format("Task #%s [%s]: %s → files: %s", task_num, status, task_text, files_str)
   end
+
+  logging.header("\n============================================")
+  logging.header("Interactive Mode")
+  logging.header("Branch: " .. branch_name)
+  logging.header("============================================\n")
 
   while true do
-    local input = readline_input(prompt)
-    if not input then break end
-    if input == "" then
-      logging.warn("Empty input — describe a task, ask a question, or type 'quit' to exit.")
-      goto continue
-    end
-    if input:lower() == "quit" or input:lower() == "exit" then break end
+    print()
+    logging.bold_white("┌──────────────────────────────────────┐")
+    logging.bold_white("│  Select action:                      │")
+    logging.bold_white("├──────────────────────────────────────┤")
+    logging.bold_white("│  1) Task     — build/modify project  │")
+    logging.bold_white("│  2) Improve  — improve Ralph itself  │")
+    logging.bold_white("│  3) Query    — ask a question        │")
+    logging.bold_white("│  q) Quit                             │")
+    logging.bold_white("└──────────────────────────────────────┘")
+    print()
+    io.write("Choice: ")
+    local choice = io.read()
 
-    -- Special commands
-    if input:lower() == "status" then
-      print(string.format("Session: %s | Done: %d | Failed: %d | Type: %s",
-        cfg.SESSION_NAME, tasks_done, tasks_failed, cfg.PROJECT_TYPE))
-      goto continue
-    end
-    if input:lower() == "help" then
-      print("Commands: status | quit | exit")
-      print("Tasks       : describe what to build/fix/add — Ralph will write files.")
-      print("Queries     : ask a question (starts with interrogative, ends with ?, or prefix with ?).")
-      print("Self-improve: 'improve yourself', 'improve prompts', etc. — rewrites Ralph's own modules.")
-      goto continue
+    if choice == "q" or choice == "Q" then
+      break
     end
 
-    -- Classify: query / self-improve / task
-    local intent, mod_target = classify_input(input, model, session_context())
-
-    if intent == "query" then
-      run_query(input, model, version, run_ts, session_context())
-    elseif intent == "self_improve" then
-      run_self_improve_interactive(input, model, run_ts, mod_target)
+    local action_type = nil
+    if choice == "1" then
+      action_type = "TASK"
+    elseif choice == "2" then
+      action_type = "SELF_IMPROVE"
+    elseif choice == "3" then
+      action_type = "QUERY"
     else
+      logging.warn("Invalid choice: '" .. tostring(choice) .. "'")
+      goto continue
+    end
+
+    -- Get user input
+    print()
+    if action_type == "TASK" then
+      io.write("Describe the task: ")
+    elseif action_type == "SELF_IMPROVE" then
+      io.write("What should be improved? ")
+    elseif action_type == "QUERY" then
+      io.write("Your question: ")
+    end
+    local input = io.read()
+
+    if not input or input:match("^%s*$") then
+      logging.warn("Empty input — skipping.")
+      goto continue
+    end
+
+    -- Handle based on action type
+    if action_type == "QUERY" then
+      logging.log("[QUERY] Processing question...")
+      local query_prompt = prompts.build_query_prompt({
+        question        = input,
+        version         = version,
+        session_context = session_context(),
+      })
+      local response = opencode.run_classify(query_prompt, model)
+      print()
+      logging.cyan("──────────────────────────────────────")
+      print(response)
+      logging.cyan("──────────────────────────────────────")
+
+    elseif action_type == "SELF_IMPROVE" then
+      logging.log("[SELF-IMPROVE] Processing improvement request...")
+      
+      -- Optional: ask which module to focus on
+      io.write("Focus on specific module? (or press Enter to skip): ")
+      local module_input = io.read()
+      local target_module = nil
+      if module_input and not module_input:match("^%s*$") then
+        target_module = module_input:match("^%s*(.-)%s*$")
+      end
+
+      self_improve.run_targeted(model, {
+        reason       = input,
+        target_module = target_module,
+        run_ts       = run_ts,
+      })
+      __refresh_modules()
+      logging.ok("Self-improvement pass complete.")
+
+    else  -- TASK
       task_counter = task_counter + 1
       local before = git_utils.snapshot_files()
       local success = run_task(task_counter, input, nil, model, version, has_sources, run_ts, session_context())

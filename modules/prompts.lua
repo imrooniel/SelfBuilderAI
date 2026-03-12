@@ -188,157 +188,122 @@ Skip straight to writing the file. Target directory: %s
   -- already knows which files exist (it just worked on them).
   local hard_cap   = ctx("CTX_PROMPT_HARD_CAP", 12000)
   local used_chars = #agents_text + #progress_text + #session_block
-                   + #section_block + #tool_block + #retry_block
-  local file_block = ""
-  if iteration == 1 then
-    local file_list = existing_sources_list()
-    if used_chars + #file_list <= hard_cap then
-      file_block = "## Existing files\n" .. file_list .. "\n\n"
-    else
-      file_block = "## Existing files\n(omitted — context budget)\n\n"
-      logging.log(string.format(
-        "[prompts] file list omitted: budget %d, used %d, list %d chars",
-        hard_cap, used_chars, #file_list))
+    + #section_block + #tool_block + #retry_block
+  local file_list = ""
+  if iteration == 1 and used_chars < hard_cap then
+    local budget_left = hard_cap - used_chars
+    if budget_left > 300 then   -- leave at least 300 chars for the list
+      file_list = existing_sources_list()
+      if #file_list > budget_left then
+        -- File list too big; truncate it
+        file_list = file_list:sub(1, budget_left) .. "\n[... truncated to fit context budget]"
+      end
     end
   end
 
+  local file_block = file_list ~= ""
+    and ("## Existing source files (sample)\n" .. file_list .. "\n\n")
+    or  ""
+
   return string.format([[
-You are a %s developer. Write code immediately — do not explore first.
+You are an expert %s developer. Complete this task:
 
-## Rules
-1. At most ONE tool call for exploration before writing.
-2. Read a file before editing it.
-3. When finished, output exactly: DONE
-
-## Project
-Path: %s | Tech: %s | Version: %s
-Dirs: %s
-%s
-## AGENTS.md
+## Task #%s: %s
+%s%s
+%s## Source directories
 %s
 
-## Recent progress
-%s
-%s%s%s%s%s## Task #%s
+%s## Project patterns & learnings (AGENTS.md tail)
 %s
 
-## On completion
-Append one discovery note to %s/%s, then output: DONE
-]],
-    tech,
-    cfg.PROJECT_PATH, tech, version,
-    src_dir_listing(),
-    type_hints ~= "" and ("Lang rules: " .. type_hints .. "\n") or "",
-    agents_text,
-    progress_text,
-    retry_block,
-    session_block,
-    section_block,
-    tool_block,
-    file_block,   -- already contains the file list (or omission notice) from the budget gate above
-    task_num, task_text,
-    cfg.PROJECT_PATH, cfg.AGENTS_FILE)
+## Recent progress (tail)
+%s
+
+%sWrite clean, production-grade code. Output DONE on its own line when complete.
+%s]],
+    tech, task_num, task_text,
+    retry_block, type_hints,
+    session_block, src_dir_listing(),
+    file_block, agents_text, progress_text,
+    section_block, tool_block)
 end
 
 -- ---------------------------------------------------------------------------
 -- build_fix_prompt
 -- ---------------------------------------------------------------------------
 function M.build_fix_prompt(opts)
-  local task_num        = opts.task_num
-  local task_text       = opts.task_text
-  local compile_errors  = opts.compile_errors or ""
-  local version         = opts.version or "unknown"
-  local session_context = cap_journal(opts.session_context or "")
+  local task_num  = opts.task_num
+  local task_text = opts.task_text
+  local error_out = opts.error_out
+  local round     = opts.round or 1
+  local version   = opts.version or "unknown"
 
   local tech = project_type.get_tech(cfg)
 
-  local session_block = session_context ~= ""
-    and ("## This session\n" .. session_context .. "\n\n")
-    or  ""
+  local compile_mod = require("compile")
+  local errors_text = compile_mod.read_errors_raw(error_out)
 
-  -- Apply budget gate — compile errors already reference specific file paths so
-  -- the full listing is less critical here; drop it if space is tight.
-  local hard_cap   = ctx("CTX_PROMPT_HARD_CAP", 12000)
-  local used_chars = #session_block + #compile_errors
-  local file_list  = existing_sources_list()
-  local file_block
-  if used_chars + #file_list <= hard_cap then
-    file_block = file_list
-  else
-    file_block = "(omitted — context budget; errors above reference the relevant paths)"
-    logging.log(string.format(
-      "[prompts] fix file list omitted: budget %d, used %d, list %d chars",
-      hard_cap, used_chars, #file_list))
+  -- Tail the error file to fit budget
+  local max_err = ctx("CTX_PROMPT_HARD_CAP", 12000) - 1000  -- leave room for prompt
+  if #errors_text > max_err then
+    errors_text = errors_text:sub(1, max_err) .. "\n[... truncated to fit context budget]"
   end
 
   return string.format([[
-You are a %s developer. Fix compile errors — do not restructure working code.
+COMPILE ERRORS detected. You must fix ALL of them now.
 
-## Rules
-1. Read each erroring file BEFORE editing.
-2. Fix ONLY the reported errors.
-3. Output exactly: DONE
+Task: #%s — %s
+Tech: %s | Version: %s
+Round: %d/%d
 
-## Project: %s | Version: %s
-%s## Task implemented: #%s — %s
-
-## Errors
+Errors:
 %s
 
-## Existing files
-%s
-
-Fix the errors, then output: DONE
+Read each error line. Fix the file it refers to. Output DONE when all errors are resolved.
 ]],
-    tech,
-    cfg.PROJECT_PATH, version,
-    session_block,
     task_num, task_text,
-    compile_errors,
-    file_block)
+    tech, version,
+    round, cfg.MAX_FIX_ROUNDS,
+    errors_text)
 end
 
 -- ---------------------------------------------------------------------------
 -- build_self_improve_prompt
 -- ---------------------------------------------------------------------------
-local MAX_SOURCE_CHARS = 24000   -- ~6k tokens
-
 function M.build_self_improve_prompt(opts)
-  local mod_name       = opts.mod_name
-  local mod_path       = opts.mod_path or ("modules/" .. mod_name .. ".lua")
-  local current_source = opts.current_source or ""
-  local reason         = opts.reason or "general"
-  local context_str    = opts.context_str or ""
-  local progress       = opts.progress or ""
+  local mod_name        = opts.mod_name        or "unknown"
+  local mod_path        = opts.mod_path        or "modules/" .. mod_name .. ".lua"
+  local current_source  = opts.current_source  or "(source unavailable)"
+  local reason          = opts.reason          or "Self-improvement pass"
+  local context         = opts.context         or {}
 
+  local MAX_SOURCE_CHARS = 15000
   if #current_source > MAX_SOURCE_CHARS then
-    -- Keep the head (public API / require block) and the tail (return M + last
-    -- few functions) so the model always sees the module contract and the end.
-    -- Losing the middle (internal helpers) is far less harmful than losing either end.
-    local head_chars = math.floor(MAX_SOURCE_CHARS * 0.6)
-    local tail_chars = MAX_SOURCE_CHARS - head_chars
-    local head = current_source:sub(1, head_chars)
-    local tail = current_source:sub(#current_source - tail_chars + 1)
-    -- Trim to line boundaries
-    head = head:match("^(.-)\n[^\n]*$") or head   -- drop the partial last line
-    local tail_start = tail:find("\n")
-    if tail_start then tail = tail:sub(tail_start + 1) end
-    current_source = head
-      .. string.format("\n\n-- [... %d chars omitted ...]\n\n", #(opts.current_source) - head_chars - tail_chars)
-      .. tail
+    current_source = current_source:sub(1, MAX_SOURCE_CHARS)
+      .. "\n[... source truncated to fit context budget]"
   end
-  local prog_cap = ctx("CTX_PROGRESS_CHARS", 2000)
-  if #progress > prog_cap then
-    progress = "[... omitted ...]\n" .. progress:sub(#progress - prog_cap + 1)
+
+  local context_str = ""
+  if type(context) == "table" then
+    local parts = {}
+    for k, v in pairs(context) do
+      parts[#parts+1] = k .. ": " .. tostring(v)
+    end
+    context_str = table.concat(parts, ", ")
+  else
+    context_str = tostring(context)
   end
+
+  local progress = read_tail(cfg.PROGRESS_FILE, ctx("CTX_PROGRESS_CHARS", 2000))
 
   return string.format([[
-You are an expert Lua developer improving a programming automation system.
+You are a self-improving AI orchestrator. Your task is to rewrite one of your
+own automation modules to fix a problem or improve behaviour.
 
-## IMPORTANT — file locations
-This is an orchestration system, NOT the project being built.
-The module you are improving is at: %s
-The entry point is: %s
+## Module location
+File:    %s
+Kernel:  %s
+
 Other modules are in the same directory as the module above.
 Do NOT look in src/, scripts/, or PROJECT_PATH for these files.
 
@@ -414,67 +379,6 @@ Do not write or modify files. Do not output DONE.
 end
 
 -- ---------------------------------------------------------------------------
--- build_classify_prompt — intent classification for REPL input.
--- The model must respond with exactly one token on the first line:
---   TASK        — build/write/fix/modify something in the project
---   SELF_IMPROVE — improve the orchestration system (Ralph) itself
---   QUERY       — answer a question, no file writes needed
--- Optionally followed by a second line:
---   MODULE: <name>   (only for SELF_IMPROVE, if a specific module is named)
--- ---------------------------------------------------------------------------
-function M.build_classify_prompt(opts)
-  local input           = opts.input or ""
-  local tech            = project_type.get_tech(cfg)
-  local session_context = opts.session_context or ""
-
-  local known_mods = "config, logging, session, todo_parser, git_utils, compile, "
-    .. "prompts, opencode, hot_reload, tool_registry, self_improve, project_type"
-
-  local session_block = session_context ~= ""
-    and ("Recent session activity:\n" .. session_context .. "\n\n")
-    or  ""
-
-  return string.format([[
-You are classifying user input for a programming automation tool called Ralph.
-Ralph has TWO completely separate contexts. Read this carefully before classifying.
-
-CONTEXT A — THE PROJECT
-  %s code being built at: %s
-  This is the user's own software project.
-
-CONTEXT B — THE ORCHESTRATOR (Ralph itself)
-  Ralph's own Lua automation modules at: %s
-  Known modules: %s
-  This is the tool the user is currently talking TO.
-
-CLASSIFICATION RULES:
-  TASK         — User wants to build, write, fix, or modify something in CONTEXT A (the project).
-  SELF_IMPROVE — User wants to improve, audit, review, or change CONTEXT B (Ralph/the orchestrator/these modules).
-  QUERY        — User wants an answer to a question; no files should be written.
-
-KEY DISAMBIGUATION:
-  - "your lua code", "your modules", "your prompts", "how do you work", "audit yourself",
-    "improve yourself", "review your code" → SELF_IMPROVE (refers to Ralph, CONTEXT B)
-  - "audit the project", "write a module for the project" → TASK (refers to CONTEXT A)
-  - Phrases like "your", "yourself", "this system", "Ralph" always mean CONTEXT B → SELF_IMPROVE or QUERY
-  - If the project is empty/new and the request mentions code that doesn't exist yet → probably SELF_IMPROVE
-  - A question about how Ralph works or what it does → QUERY
-
-If SELF_IMPROVE and a specific module name is mentioned or clearly implied, add a second line:
-  MODULE: <module_name>
-
-Respond with ONLY the category (and optional MODULE line). No explanation.
-
-%sInput: %s
-]],
-    tech, cfg.PROJECT_PATH,
-    cfg.KERNEL_MODULES_DIR or _G.KERNEL_MODULES_DIR or "modules/",
-    known_mods,
-    session_block,
-    input)
-end
-
--- ---------------------------------------------------------------------------
 -- Nudge prompts — rotated by get_nudge(count) so repeated nudges don't feel
 -- identical. FIX nudges are round-aware to escalate urgency.
 -- ---------------------------------------------------------------------------
@@ -515,6 +419,48 @@ end
 
 -- Keep the old static field for any callers that reference it directly
 M.FIX_NUDGE_PROMPT = _FIX_NUDGE_PROMPTS[1]
+
+-- ---------------------------------------------------------------------------
+-- build_reflection_prompt — self-review before compile check
+-- ---------------------------------------------------------------------------
+function M.build_reflection_prompt(opts)
+  local task_num  = opts.task_num
+  local task_text = opts.task_text
+  local version   = opts.version or "unknown"
+
+  local tech = project_type.get_tech(cfg)
+
+  return string.format([[
+SELF-REVIEW CHECKPOINT
+
+You just completed this task:
+  Task #%s: %s
+  Tech: %s | Version: %s
+
+Before we proceed, critically review your implementation:
+
+1. Did you FULLY complete the task as specified?
+2. Are there any edge cases, error handling, or validation missing?
+3. Does the code follow best practices for %s?
+4. Are there any logical errors, typos, or incomplete sections?
+5. Did you write tests/documentation if the task required them?
+
+If you find ANY issues or incompleteness:
+  - Fix them NOW
+  - Re-read relevant files if needed
+  - Write the corrected code
+  - Output DONE when truly complete
+
+If the implementation is genuinely complete and correct:
+  - Output: REFLECTION_OK
+  - Do NOT make unnecessary changes
+
+Be honest and thorough. This is your chance to catch mistakes before compilation.
+]],
+    task_num, task_text,
+    tech, version,
+    tech)
+end
 
 -- ---------------------------------------------------------------------------
 -- validate — called by hot_reload after a rewrite.

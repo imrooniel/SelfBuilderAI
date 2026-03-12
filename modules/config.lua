@@ -75,6 +75,12 @@ M.MAX_CONTINUES  = 8   -- max --continue nudges within one Ralph iteration
 M.MAX_FIX_ROUNDS = 5   -- max compile-fix iterations per task
 
 -- ---------------------------------------------------------------------------
+-- Self-reflection settings
+-- ---------------------------------------------------------------------------
+M.SELF_REFLECTION_ENABLED = true   -- set false to skip reflection step
+M.SELF_REFLECTION_MAX_ROUNDS = 2   -- max number of reflection fix rounds before proceeding to compile
+
+-- ---------------------------------------------------------------------------
 -- Session name (override via first CLI arg)
 -- ---------------------------------------------------------------------------
 M.SESSION_NAME = arg and arg[1] or "automation"
