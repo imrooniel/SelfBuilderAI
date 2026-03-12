@@ -29,6 +29,39 @@ local cfg          = require("config")
 local project_type = require("project_type")
 
 -- ---------------------------------------------------------------------------
+-- Thinking instruction — prompt models to show their reasoning process
+-- ---------------------------------------------------------------------------
+M.THINKING_INSTRUCTION = [[
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHOW YOUR REASONING: Wrap your planning and thought process in <think>...</think> tags.
+This helps track your decision-making and catches errors early.
+
+Example:
+<think>
+I need to implement user authentication. Key considerations:
+- Password hashing using bcrypt
+- Email validation with regex
+- Session management with JWT tokens
+- Edge case: handle already-registered emails
+</think>
+
+Then implement the solution.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+]]
+
+-- ---------------------------------------------------------------------------
+-- Helper: wrap a prompt with thinking instruction if enabled
+-- ---------------------------------------------------------------------------
+local function with_thinking(base_prompt)
+  -- Check config to see if thinking prompts are enabled
+  if cfg.SHOW_THINKING_ENABLED == false then
+    return base_prompt
+  end
+  return M.THINKING_INSTRUCTION .. base_prompt
+end
+
+-- ---------------------------------------------------------------------------
 -- Defaults for context-budget fields (safe values if config is old/missing)
 -- ---------------------------------------------------------------------------
 local function ctx(field, default)
@@ -205,7 +238,7 @@ Skip straight to writing the file. Target directory: %s
     and ("## Existing source files (sample)\n" .. file_list .. "\n\n")
     or  ""
 
-  return string.format([[
+  local base_prompt = string.format([[
 You are an expert %s developer. Complete this task:
 
 ## Task #%s: %s
@@ -226,6 +259,8 @@ You are an expert %s developer. Complete this task:
     session_block, src_dir_listing(),
     file_block, agents_text, progress_text,
     section_block, tool_block)
+
+  return with_thinking(base_prompt)
 end
 
 -- ---------------------------------------------------------------------------
@@ -430,7 +465,7 @@ function M.build_reflection_prompt(opts)
 
   local tech = project_type.get_tech(cfg)
 
-  return string.format([[
+  local base_prompt = string.format([[
 SELF-REVIEW CHECKPOINT
 
 You just completed this task:
@@ -460,6 +495,8 @@ Be honest and thorough. This is your chance to catch mistakes before compilation
     task_num, task_text,
     tech, version,
     tech)
+
+  return with_thinking(base_prompt)
 end
 
 -- ---------------------------------------------------------------------------

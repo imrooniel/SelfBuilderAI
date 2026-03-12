@@ -81,6 +81,12 @@ M.SELF_REFLECTION_ENABLED = true   -- set false to skip reflection step
 M.SELF_REFLECTION_MAX_ROUNDS = 2   -- max number of reflection fix rounds before proceeding to compile
 
 -- ---------------------------------------------------------------------------
+-- Thinking display settings
+-- ---------------------------------------------------------------------------
+M.SHOW_THINKING_ENABLED = true     -- prompt models to show reasoning in <think> tags
+M.OPENCODE_FLAGS = ""               -- additional CLI flags for opencode (e.g., "--verbose")
+
+-- ---------------------------------------------------------------------------
 -- Session name (override via first CLI arg)
 -- ---------------------------------------------------------------------------
 M.SESSION_NAME = arg and arg[1] or "automation"

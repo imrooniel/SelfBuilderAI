@@ -171,9 +171,10 @@ function M.run_fresh(log_file, prompt, model)
   local pf = io.open(prompt_file, "w")
   if pf then pf:write(prompt); pf:close() end
 
+  local flags = cfg.OPENCODE_FLAGS or ""
   local cmd = string.format(
-    '"%s" run --model "%s" --title "%s" "$(cat %s)"',
-    cfg.OPENCODE, model, title, prompt_file)
+    '"%s" run %s --model "%s" --title "%s" "$(cat %s)"',
+    cfg.OPENCODE, flags, model, title, prompt_file)
 
   stream_cmd(cmd, log_file)
   os.remove(prompt_file)
@@ -196,17 +197,18 @@ function M.run_continue(log_file, session_id, nudge, model)
   local nf = io.open(nudge_file, "w")
   if nf then nf:write(nudge); nf:close() end
 
+  local flags = cfg.OPENCODE_FLAGS or ""
   local cmd
   if session_id and session_id ~= "" then
     logging.log("Continuing session: " .. session_id)
     cmd = string.format(
-      '"%s" run --model "%s" --continue --session "%s" "$(cat %s)"',
-      cfg.OPENCODE, model, session_id, nudge_file)
+      '"%s" run %s --model "%s" --continue --session "%s" "$(cat %s)"',
+      cfg.OPENCODE, flags, model, session_id, nudge_file)
   else
     logging.warn("No session ID — sending nudge as new session (context lost)")
     cmd = string.format(
-      '"%s" run --model "%s" "$(cat %s)"',
-      cfg.OPENCODE, model, nudge_file)
+      '"%s" run %s --model "%s" "$(cat %s)"',
+      cfg.OPENCODE, flags, model, nudge_file)
   end
 
   stream_cmd(cmd, log_file)
