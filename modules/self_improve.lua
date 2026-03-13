@@ -62,13 +62,38 @@ local function read_progress()
 end
 
 -- ---------------------------------------------------------------------------
+-- Helper: sanitize a string for safe use in filenames
+-- ---------------------------------------------------------------------------
+local function sanitize_filename(str)
+  -- Replace problematic characters with underscores
+  local safe = str:gsub("[^a-zA-Z0-9_%-]", "_")
+  -- Collapse multiple underscores
+  safe = safe:gsub("_+", "_")
+  -- Trim to reasonable length
+  safe = safe:sub(1, 80)
+  -- Remove leading/trailing underscores
+  safe = safe:gsub("^_+", ""):gsub("_+$", "")
+  return safe
+end
+
+-- ---------------------------------------------------------------------------
 -- Helper: run an improvement call and extract Lua source from log
 -- ---------------------------------------------------------------------------
 local function run_improve_call(model, prompt, log_path)
   local f = io.open(log_path, "w"); if f then f:close() end
+  
+  -- Show a snippet of the prompt being sent
+  local prompt_preview = prompt:sub(1, 200):gsub("\n", " ")
+  if #prompt > 200 then prompt_preview = prompt_preview .. "..." end
+  logging.log(string.format("[self_improve] Prompt preview: %s", 
+    logging.dim(prompt_preview)))
+  
   opencode.run_fresh(log_path, prompt, model)
 
   local log_content = read_file(log_path)
+  
+  -- Show raw response size before extraction
+  logging.log(string.format("[self_improve] AI response: %d chars", #log_content))
 
   -- Extract the Lua source block. The model is instructed to return raw Lua
   -- with no markdown fences, starting with a module header comment and ending
@@ -110,6 +135,21 @@ local function run_improve_call(model, prompt, log_path)
   end
 
   if not start_idx or not end_idx or end_idx < start_idx then
+    -- Show WHY extraction failed
+    logging.warn("[self_improve] Could not extract Lua source from response")
+    logging.warn("[self_improve] Looking for patterns: --[[, local M = {}, return M")
+    
+    -- Show first few lines of response for debugging
+    local preview_lines = {}
+    for i = 1, math.min(5, #lines) do
+      preview_lines[#preview_lines+1] = lines[i]
+    end
+    if #preview_lines > 0 then
+      logging.warn("[self_improve] Response starts with:")
+      for _, line in ipairs(preview_lines) do
+        logging.warn("  " .. logging.dim(line))
+      end
+    end
     return nil
   end
 
@@ -126,9 +166,11 @@ end
 local function apply_rewrite(mod_name, new_source, reason)
   if not new_source or new_source:match("^%s*$") then
     logging.warn(string.format("[self_improve] %s: AI returned empty source — skipping.", mod_name))
+    logging.warn(string.format("[self_improve] Check log file for details"))
     return false
   end
 
+  logging.log(string.format("[self_improve] Extracted rewrite: %d chars", #new_source))
   logging.log(string.format("[self_improve] Applying rewrite to %s (%s)...", mod_name, reason))
   local ok, err = hot_reload.write_and_reload(mod_name, new_source)
   if ok then
@@ -170,6 +212,11 @@ function M.run_targeted(model, opts)
   elseif context.target_override then
     -- Caller specified exact module(s) list — honour it directly
     targets = context.target_override
+  elseif reason:lower():match("create tool") or reason:lower():match("new tool") then
+    -- User wants to create a new tool, not improve an existing module
+    -- Route to tool_registry which handles tool creation
+    targets = { "tool_registry" }
+    context.hint = "User wants to CREATE a new tool. Review tool_registry.lua contract and write a new tool file to tools/ directory. Then register it."
   elseif reason == "user_request" or reason:match("^improve") then
     -- User typed something like "improve yourself" with no specific module.
     -- Default to the two highest-value modules for general improvement.
@@ -187,10 +234,18 @@ function M.run_targeted(model, opts)
     targets = { "prompts" }
   end
 
+  -- Show which modules will be improved
+  logging.log(string.format("[self_improve] Target modules: %s", table.concat(targets, ", ")))
+
   local progress = read_progress()
   local run_ts   = opts.run_ts or os.date("%Y%m%d-%H%M%S")
+  local rewrites_applied = 0
 
   for _, mod_name in ipairs(targets) do
+    -- Show current module being processed
+    print()
+    logging.header(string.format("━━━ Improving module: %s ━━━", mod_name))
+    
     -- Prefer the live source tracked by hot_reload; fall back to reading from
     -- disk by resolving through package.path (same mechanism hot_reload uses).
     local current_source = hot_reload.source(mod_name)
@@ -206,6 +261,14 @@ function M.run_targeted(model, opts)
     end
     current_source = current_source or "(source not found)"
 
+    -- Show module source size
+    if current_source ~= "(source not found)" then
+      logging.log(string.format("[self_improve] Current %s.lua: %d chars", 
+        mod_name, #current_source))
+    else
+      logging.warn(string.format("[self_improve] Could not load %s.lua source", mod_name))
+    end
+
     local prompt_text = prompts.build_self_improve_prompt({
       mod_name       = mod_name,
       mod_path       = module_path(mod_name),
@@ -215,15 +278,36 @@ function M.run_targeted(model, opts)
                        tostring(context.task_text or "") .. " — " ..
                        tostring(context.prior_note or ""),
       progress       = progress,
+      hint           = context.hint,  -- Pass through hint for tool creation
     })
 
     os.execute('mkdir -p "' .. cfg.PROJECT_PATH .. '/logs"')
+    
+    -- Sanitize reason for safe filename
+    local safe_reason = sanitize_filename(reason)
     local log_path = string.format("%s/logs/self-improve-%s-%s-%s.log",
-      cfg.PROJECT_PATH, mod_name, reason, run_ts)
+      cfg.PROJECT_PATH, mod_name, safe_reason, run_ts)
+
+    -- Show log file location
+    logging.log(string.format("[self_improve] Log: %s", log_path))
+    logging.log(string.format("[self_improve] Sending improvement prompt to model..."))
 
     local new_source = run_improve_call(model, prompt_text, log_path)
-    apply_rewrite(mod_name, new_source, reason)
+    if apply_rewrite(mod_name, new_source, reason) then
+      rewrites_applied = rewrites_applied + 1
+    end
   end
+
+  -- Summary
+  print()
+  logging.header("━━━ Self-Improvement Summary ━━━")
+  logging.log(string.format("Modules targeted: %d", #targets))
+  logging.log(string.format("Modules successfully rewritten: %d", rewrites_applied))
+  logging.log(string.format("Modules skipped (empty/invalid): %d", #targets - rewrites_applied))
+  if rewrites_applied > 0 then
+    logging.ok("Changes committed to git.")
+  end
+  logging.ok("Self-improvement pass complete.")
 end
 
 -- ---------------------------------------------------------------------------

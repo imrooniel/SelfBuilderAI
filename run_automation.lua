@@ -2,7 +2,7 @@
 --[[
   run_automation.lua — KERNEL (read-only to the AI agent)
 
-  SelfBuilderAI - a general-purpose AI agent orchestrator implementing the Ralph pattern
+  SelfBuilderAI - a general-purpose AI agent orchestrator extending the Ralph pattern
   (fresh-context outer loop + continue-nudge inner loop) with self-improvement.
 
   Supported project types (configured in modules/config.lua):
@@ -377,7 +377,7 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
     print(logging.bold_white("│  Select action:                      │"))
     print(logging.bold_white("├──────────────────────────────────────┤"))
     print(logging.bold_white("│  1) Task     — build/modify project  │"))
-    print(logging.bold_white("│  2) Improve  — improve Ralph itself  │"))
+    print(logging.bold_white("│  2) Improve  — improve SelfBuilderAI itself  │"))
     print(logging.bold_white("│  3) Query    — ask a question        │"))
     print(logging.bold_white("│  q) Quit                             │"))
     print(logging.bold_white("└──────────────────────────────────────┘"))
@@ -426,10 +426,10 @@ local function run_interactive_loop(model, version, has_sources, branch_name)
         session_context = session_context(),
       })
       local response = opencode.run_classify(query_prompt, model)
-      print()
-      logging.cyan("──────────────────────────────────────")
-      print(response)
-      logging.cyan("──────────────────────────────────────")
+      -- Response already streamed to stdout by run_classify() with color coding
+      
+      -- Record Q&A in journal so subsequent queries have conversational context
+      journal[#journal+1] = string.format("Q: %s\nA: %s", input, response)
 
     elseif action_type == "SELF_IMPROVE" then
       logging.log("[SELF-IMPROVE] Processing improvement request...")
@@ -515,7 +515,7 @@ local function main()
   local tech    = project_type.get_tech(cfg)
 
   logging.header("============================================")
-  logging.header("Ralph — AI Programming Orchestrator  [Self-Improving]")
+  logging.header("SelfBuilderAI — AI Programming Orchestrator  [Self-Improving]")
   logging.header(string.format("  Kernel      : v%s (read-only)", KERNEL_VERSION))
   logging.header(string.format("  Project     : %s", cfg.PROJECT_PATH))
   logging.header(string.format("  Type        : %s", cfg.PROJECT_TYPE))
@@ -612,7 +612,7 @@ local function main()
     -- Session summary
     print()
     logging.header("============================================")
-    logging.header("Session complete!  [Ralph v" .. KERNEL_VERSION .. "]")
+    logging.header("Session complete!  [SelfBuilderAI v" .. KERNEL_VERSION .. "]")
     logging.header(string.format("  Branch      : %s", branch_name))
     logging.header(string.format("  Type        : %s | %s", cfg.PROJECT_TYPE, tech))
     logging.header(string.format("  Done        : %d", tasks_done))

@@ -70,8 +70,8 @@ M.SNAPSHOT_SKIP_DIRS = {
 -- ---------------------------------------------------------------------------
 -- Iteration limits
 -- ---------------------------------------------------------------------------
-M.MAX_ITERATIONS = 5   -- max fresh Ralph restarts per task
-M.MAX_CONTINUES  = 8   -- max --continue nudges within one Ralph iteration
+M.MAX_ITERATIONS = 5   -- max fresh SelfBuilderAI restarts per task
+M.MAX_CONTINUES  = 8   -- max --continue nudges within one SelfBuilderAI iteration
 M.MAX_FIX_ROUNDS = 5   -- max compile-fix iterations per task
 
 -- ---------------------------------------------------------------------------
@@ -96,10 +96,10 @@ M.SESSION_NAME = arg and arg[1] or "automation"
 -- ---------------------------------------------------------------------------
 M.PROGRESS_FILE       = "progress.txt"
 M.AGENTS_FILE         = "AGENTS.md"
-M.ARCHIVE_DIR         = ".ralph-archive"
-M.LAST_SESSION_FILE   = ".ralph-last-session"
+M.ARCHIVE_DIR         = ".selfbuilderai-archive"
+M.LAST_SESSION_FILE   = ".selfbuilderai-last-session"
 M.KERNEL_SUGGESTIONS  = "KERNEL_SUGGESTIONS.md"
-M.TOOL_REGISTRY_FILE  = ".ralph-tools.json"
+M.TOOL_REGISTRY_FILE  = ".selfbuilderai-tools.json"
 
 -- ---------------------------------------------------------------------------
 -- Self-improvement settings

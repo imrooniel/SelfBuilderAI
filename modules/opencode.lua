@@ -3,8 +3,8 @@
   AI-rewritable.
 
   Two public functions:
-    run_fresh()    — start a brand-new session (Ralph outer loop)
-    run_continue() — nudge an existing session (Ralph inner loop)
+    run_fresh()    — start a brand-new session (SelfBuilderAI outer loop)
+    run_continue() — nudge an existing session (SelfBuilderAI inner loop)
 ]]
 
 local M = {}

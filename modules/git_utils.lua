@@ -43,8 +43,8 @@ function M.ensure_git_repo()
   if not M.is_git_repo() then
     logging.log("Initialising git repository in " .. cfg.PROJECT_PATH)
     git("init")
-    git('config user.email "ralph-automation@localhost"', false)
-    git('config user.name "Ralph Automation"', false)
+    git('config user.email "selfbuilderai-automation@localhost"', false)
+    git('config user.name "SelfBuilderAI Automation"', false)
     -- Create an initial commit so branches can be made
     local readme = cfg.PROJECT_PATH .. "/README.md"
     local f = io.open(readme, "w")
