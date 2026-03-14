@@ -204,61 +204,52 @@ Skip straight to writing the file. Target directory: %s
   end
 
   local session_block = session_context ~= ""
-    and ("## This session — completed tasks\n" .. session_context .. "\n\n")
-    or  ""
-
-  local section_block = section_context ~= ""
-    and ("## Sibling tasks in this batch\n" .. section_context .. "\n\n")
-    or  ""
-
-  local tool_block = tool_context ~= ""
-    and (tool_context .. "\n\n")
-    or  ""
-
-  -- Context budget enforcement: measure supplementary sections and gate
-  -- the file list so the total supplementary context stays under the cap.
-  -- Only include the file list on the first iteration — on retries the model
-  -- already knows which files exist (it just worked on them).
-  local hard_cap   = ctx("CTX_PROMPT_HARD_CAP", 12000)
-  local used_chars = #agents_text + #progress_text + #session_block
-    + #section_block + #tool_block + #retry_block
-  local file_list = ""
-  if iteration == 1 and used_chars < hard_cap then
-    local budget_left = hard_cap - used_chars
-    if budget_left > 300 then   -- leave at least 300 chars for the list
-      file_list = existing_sources_list()
-      if #file_list > budget_left then
-        -- File list too big; truncate it
-        file_list = file_list:sub(1, budget_left) .. "\n[... truncated to fit context budget]"
-      end
-    end
-  end
-
-  local file_block = file_list ~= ""
-    and ("## Existing source files (sample)\n" .. file_list .. "\n\n")
+    and ("## This session\n" .. session_context .. "\n\n")
     or  ""
 
   local base_prompt = string.format([[
-You are an expert %s developer. Complete this task:
+You are an expert %s engineer. You will implement the following task fully
+using the available code-editing tools. The task may involve creating new
+files, modifying existing files, or both.
 
-## Task #%s: %s
+%s## Task #%s
+%s
+
+## Project metadata
+Path:         %s
+Tech:         %s
+Version:      %s
+Type hints:   %s
+
+## Standard directories
+%s
+
+## Current source files
+%s
+
+## Learnings from past tasks (tail of progress.txt)
+%s
+
+## Codebase patterns and conventions (tail of AGENTS.md)
+%s
+
 %s%s
-%s## Source directories
-%s
 
-%s## Project patterns & learnings (AGENTS.md tail)
-%s
-
-## Recent progress (tail)
-%s
-
-%sWrite clean, production-grade code. Output DONE on its own line when complete.
-%s]],
-    tech, task_num, task_text,
-    retry_block, type_hints,
-    session_block, src_dir_listing(),
-    file_block, agents_text, progress_text,
-    section_block, tool_block)
+When you have FULLY completed the task and written all required files:
+  • Output the word DONE on its own line.
+  • Do NOT continue working after DONE.
+  • Do NOT output DONE until all files are written and the task is complete.
+]],
+    tech,
+    retry_block,
+    task_num, task_text,
+    cfg.PROJECT_PATH, tech, version, type_hints,
+    src_dir_listing(),
+    existing_sources_list(),
+    progress_text,
+    agents_text,
+    session_block,
+    tool_context)
 
   return with_thinking(base_prompt)
 end
@@ -267,48 +258,49 @@ end
 -- build_fix_prompt
 -- ---------------------------------------------------------------------------
 function M.build_fix_prompt(opts)
-  local task_num  = opts.task_num
-  local task_text = opts.task_text
-  local error_out = opts.error_out
-  local round     = opts.round or 1
-  local version   = opts.version or "unknown"
+  local task_num   = opts.task_num
+  local task_text  = opts.task_text
+  local errors     = opts.errors or {}
+  local round      = opts.round or 1
+  local version    = opts.version or "unknown"
 
   local tech = project_type.get_tech(cfg)
 
-  local compile_mod = require("compile")
-  local errors_text = compile_mod.read_errors_raw(error_out)
+  local err_count = #errors
+  local err_block = table.concat(errors, "\n")
 
-  -- Tail the error file to fit budget
-  local max_err = ctx("CTX_PROMPT_HARD_CAP", 12000) - 1000  -- leave room for prompt
-  if #errors_text > max_err then
-    errors_text = errors_text:sub(1, max_err) .. "\n[... truncated to fit context budget]"
-  end
+  local base_prompt = string.format([[
+COMPILE CHECK FAILED — %d error(s) found. Fix them now.
 
-  return string.format([[
-COMPILE ERRORS detected. You must fix ALL of them now.
-
-Task: #%s — %s
+Task #%s: %s
 Tech: %s | Version: %s
-Round: %d/%d
+Fix round: %d
 
 Errors:
 %s
 
-Read each error line. Fix the file it refers to. Output DONE when all errors are resolved.
+Instructions:
+1. Read each failing file mentioned in the errors above.
+2. Fix the root cause — do not mask the problem or disable warnings.
+3. Re-run write_file for each corrected file.
+4. Output DONE on its own line when all errors are fixed.
 ]],
+    err_count,
     task_num, task_text,
     tech, version,
-    round, cfg.MAX_FIX_ROUNDS,
-    errors_text)
+    round,
+    err_block)
+
+  return with_thinking(base_prompt)
 end
 
 -- ---------------------------------------------------------------------------
--- build_self_improve_prompt
+-- build_self_improve_prompt — rewrite one of the orchestrator's own modules
 -- ---------------------------------------------------------------------------
 function M.build_self_improve_prompt(opts)
-  local mod_name        = opts.mod_name        or "unknown"
-  local mod_path        = opts.mod_path        or "modules/" .. mod_name .. ".lua"
-  local current_source  = opts.current_source  or "(source unavailable)"
+  local mod_path        = opts.mod_path
+  local mod_name        = opts.mod_name
+  local current_source  = opts.current_source
   local reason          = opts.reason          or "Self-improvement pass"
   local context         = opts.context         or {}
 
@@ -395,15 +387,26 @@ function M.build_query_prompt(opts)
     or  ""
 
   return string.format([[
-You are a %s developer assistant. Answer concisely.
+You are a %s developer assistant. Answer the user's question concisely and completely.
 
 Project: %s | Tech: %s | Version: %s
 Dirs: %s
 Files: %s
 
-%s%s
+%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION: %s
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Do not write or modify files. Do not output DONE.
+IMPORTANT INSTRUCTIONS:
+1. You may use tools to explore the project and gather context.
+2. After gathering necessary information, provide a COMPLETE answer.
+3. Do NOT write or modify any files.
+4. Do NOT output DONE - this is a query, not a task.
+5. When your answer is complete, simply STOP. Do not keep using tools.
+6. Keep your final answer focused and concise.
+7. If you need to examine code, do so, then provide your answer and STOP.
+
+Provide your answer now:
 ]],
     tech,
     cfg.PROJECT_PATH, tech, version,

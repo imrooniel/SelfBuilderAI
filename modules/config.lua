@@ -75,6 +75,11 @@ M.MAX_CONTINUES  = 8   -- max --continue nudges within one SelfBuilderAI iterati
 M.MAX_FIX_ROUNDS = 5   -- max compile-fix iterations per task
 
 -- ---------------------------------------------------------------------------
+-- Query mode settings
+-- ---------------------------------------------------------------------------
+M.QUERY_MAX_TOOL_CALLS = 15  -- max tool calls allowed in query mode before forcing completion
+
+-- ---------------------------------------------------------------------------
 -- Self-reflection settings
 -- ---------------------------------------------------------------------------
 M.SELF_REFLECTION_ENABLED = true   -- set false to skip reflection step

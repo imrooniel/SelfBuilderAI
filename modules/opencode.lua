@@ -218,8 +218,10 @@ end
 
 -- ---------------------------------------------------------------------------
 -- run_classify — lightweight call for structured short responses.
--- CHANGED: Now streams output to stdout AND captures it for return value.
+-- Streams output to stdout AND captures it for return value.
 -- Intended for classification / routing decisions and query responses.
+--
+-- ENHANCED: For query mode, enforces a tool-call limit to prevent infinite loops.
 -- ---------------------------------------------------------------------------
 function M.run_classify(prompt, model)
   local prompt_file = os.tmpname()
@@ -237,11 +239,43 @@ function M.run_classify(prompt, model)
   reset_think_state()
   local handle = io.popen(cmd)
   local lines = {}
+  local tool_call_count = 0
+  local max_tool_calls = cfg.QUERY_MAX_TOOL_CALLS or 15
+  
   if handle then
     for line in handle:lines() do
       classify_and_print(line)
-      -- Also capture for return value
       lines[#lines+1] = line
+      
+      -- Count tool calls to detect runaway query loops
+      local stripped = line:match("^%s*(.-)%s*$")
+      local tool_markers = {
+        "running tool", "calling ", "→ read_file", "→ write_file", 
+        "→ bash", "→ grep", "→ find", "● "
+      }
+      for _, marker in ipairs(tool_markers) do
+        if stripped:lower():sub(1, #marker) == marker:lower() then
+          tool_call_count = tool_call_count + 1
+          
+          if tool_call_count >= max_tool_calls then
+            logging.warn(string.format(
+              "Query mode: %d tool calls reached limit (%d) — stopping to prevent runaway loop.",
+              tool_call_count, max_tool_calls))
+            logging.warn("The model may have been gathering context indefinitely.")
+            logging.warn("Forcing completion. If answer is incomplete, try rephrasing your question.")
+            handle:close()
+            os.remove(prompt_file)
+            
+            -- Append a warning to the output
+            lines[#lines+1] = ""
+            lines[#lines+1] = "[Query terminated: tool call limit reached]"
+            local output = table.concat(lines, "\n")
+            output = output:gsub("\027%[[%d;]*%a", ""):gsub("\r", "")
+            return output
+          end
+          break
+        end
+      end
     end
     handle:close()
   end
@@ -250,7 +284,21 @@ function M.run_classify(prompt, model)
   local output = table.concat(lines, "\n")
   -- Strip ANSI codes and carriage returns from captured output
   output = output:gsub("\027%[[%d;]*%a", ""):gsub("\r", "")
+  
+  if tool_call_count > 0 then
+    logging.log(string.format("Query completed with %d tool call(s).", tool_call_count))
+  end
+  
   return output
+end
+
+-- ---------------------------------------------------------------------------
+-- validate — called by hot_reload after a rewrite
+-- ---------------------------------------------------------------------------
+function M.validate()
+  local c = require("config")
+  assert(type(c.OPENCODE) == "string", "config.OPENCODE missing")
+  assert(type(c.PROJECT_PATH) == "string", "config.PROJECT_PATH missing")
 end
 
 return M
